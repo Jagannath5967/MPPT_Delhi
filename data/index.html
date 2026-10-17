@@ -115,7 +115,8 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI"
 .mode-btn{border:1px solid var(--border);background:var(--bg3);color:var(--text2);padding:3px 10px;border-radius:6px;font-size:.76em;font-weight:700;cursor:pointer;transition:all .15s;}
 .mode-btn:hover:not(:disabled){color:var(--text);}
 .mode-btn.m-mppt{background:rgba(0,200,255,.15);color:var(--cyan);border-color:rgba(0,200,255,.4);}
-.mode-btn.m-pwm{background:rgba(255,193,7,.15);color:var(--yellow);border-color:rgba(255,193,7,.4);}
+.mode-btn.m-hybrid{background:rgba(156,107,255,.15);color:var(--purple);border-color:rgba(156,107,255,.4);}
+.mode-btn.m-pwm-auto{background:rgba(52,211,153,.15);color:#34d399;border-color:rgba(52,211,153,.4);}
 .mode-btn:disabled{opacity:.4;cursor:not-allowed;}
 
 /* ── Selects ── */
@@ -160,16 +161,6 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
 /* ── Arc gauge canvas ── */
 .arc-ctr{display:flex;justify-content:center;margin:4px 0;}
 
-/* ── AI Data Logs table ── */
-.ai-table-scroll{overflow:auto;max-height:520px;border:1px solid var(--border);border-radius:8px;}
-.ai-table{width:100%;border-collapse:collapse;font-size:.72em;font-family:monospace;white-space:nowrap;}
-.ai-table thead th{background:var(--bg3);color:var(--cyan);padding:7px 10px;border-bottom:2px solid var(--bdr2);text-align:right;position:sticky;top:0;z-index:2;}
-.ai-table thead th:first-child{text-align:left;min-width:160px;}
-.ai-table tbody td{padding:5px 10px;border-bottom:1px solid var(--border);color:var(--text);text-align:right;}
-.ai-table tbody td:first-child{text-align:left;color:var(--muted);}
-.ai-table tbody tr:hover td{background:rgba(0,200,255,.04);}
-.ai-table tbody tr:last-child td{border-bottom:none;}
-
 /* ── Responsive ── */
 @media(max-width:800px){
   #sidebar{transform:translateX(-100%);transition:transform .25s;}
@@ -177,6 +168,13 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   #content{margin-left:0;}
   #btn-menu{display:block;}
   .card.w2{grid-column:unset;}
+}
+@media(max-width:480px){
+  #content{padding:10px 8px;}
+  .cards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));}
+  .chart-box canvas{max-height:140px;}
+  .big{font-size:1.5em;}
+  .charts-row{grid-template-columns:1fr;}
 }
 </style>
 </head>
@@ -189,8 +187,9 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   <span id="t-dot"></span>
   <span id="t-stage">Stopped</span>
   <div id="mode-toggle" style="display:flex;gap:3px;flex-shrink:0;" title="Operating mode — locked while charging">
-    <button id="btn-mode-pwm"  class="mode-btn" onclick="doSetMode('PWM')">Fixed PWM</button>
-    <button id="btn-mode-mppt" class="mode-btn m-mppt" onclick="doSetMode('MPPT')">MPPT</button>
+    <button id="btn-mode-mppt"     class="mode-btn m-mppt" onclick="doSetMode('MPPT')">MPPT</button>
+    <button id="btn-mode-hybrid"   class="mode-btn"        onclick="doSetMode('HYBRID')">Hybrid</button>
+    <button id="btn-mode-pwm-auto" class="mode-btn"        onclick="doSetMode('PWM_AUTO')">Auto PWM</button>
   </div>
   <span id="t-msg">Connecting…</span>
   <div class="t-right">
@@ -213,7 +212,7 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   <div class="nav-section">System</div>
   <div class="nav-item" data-tab="status"><span class="nav-icon">✦</span>System Status</div>
   <div class="nav-item" data-tab="logs"><span class="nav-icon">≡</span>Event Logs</div>
-  <div class="nav-item" data-tab="ailogs"><span class="nav-icon">⬡</span>AI Data Logs</div>
+  <div class="nav-item" data-tab="aimonitor"><span class="nav-icon">◈</span>AI Monitor</div>
   <div class="nav-item" data-tab="settings"><span class="nav-icon">◎</span>Settings</div>
 </nav>
 
@@ -565,35 +564,79 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   </div>
 </div><!-- /logs -->
 
-<!-- ── TAB: AI DATA LOGS ── -->
-<div id="tab-ailogs" class="tab">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
-    <button class="btn btn-sm" onclick="exportAiCsv()">↓ Export CSV</button>
-    <button class="btn btn-sm" onclick="clearAiLogs()">✕ Clear</button>
-    <span style="font-size:.8em;color:var(--muted)" id="ai-count">0 rows</span>
-    <span style="font-size:.78em;color:var(--text2);margin-left:6px;" id="ai-status">Waiting for MPPT to start…</span>
+<!-- ── TAB: AI MONITOR ── -->
+<div id="tab-aimonitor" class="tab">
+  <!-- Stat cards row -->
+  <div class="cards" style="margin-bottom:8px;">
+    <div class="card" style="padding:10px 12px;">
+      <div class="card-head"><span class="card-icon" style="color:var(--cyan)">◈</span><span class="card-title" style="color:var(--cyan)">Predicted Vmp</span></div>
+      <div class="big" id="aim-vmp" style="color:var(--cyan);font-size:1.6em;">—<span class="big-unit">V</span></div>
+      <div class="row" style="margin-top:4px;"><span>Actual PV V</span><span class="val" id="aim-pvv">—</span></div>
+      <div id="aim-vmp-drift" style="font-size:.76em;margin-top:5px;color:var(--muted);">—</div>
+    </div>
+    <div class="card" style="padding:10px 12px;">
+      <div class="card-head"><span class="card-icon" style="color:var(--purple)">⬡</span><span class="card-title" style="color:var(--purple)">Predicted Duty</span></div>
+      <div class="big" id="aim-pred-duty" style="color:var(--purple);font-size:1.6em;">—<span class="big-unit">%</span></div>
+      <div class="row" style="margin-top:4px;"><span>Current Duty</span><span class="val" id="aim-cur-duty">—</span></div>
+      <div class="row"><span>Δ Duty (AI − actual)</span><span class="val" id="aim-delta-duty" style="color:var(--muted);">—</span></div>
+    </div>
+    <div class="card" style="padding:10px 12px;">
+      <div class="card-head"><span class="card-icon" style="color:var(--yellow)">☀</span><span class="card-title" style="color:var(--yellow)">PV Power</span></div>
+      <div class="big" id="aim-pvw" style="color:var(--yellow);font-size:1.6em;">—<span class="big-unit">W</span></div>
+      <div class="row" style="margin-top:4px;"><span>Mode</span><span class="val" id="aim-mode">—</span></div>
+    </div>
+    <div class="card" style="padding:10px 12px;">
+      <div class="card-head"><span class="card-icon" style="color:var(--green)">◉</span><span class="card-title" style="color:var(--green)">Inference</span></div>
+      <div style="margin-top:6px;"><span class="badge" id="aim-confidence-badge"><span class="bdot"></span><span id="aim-status">Idle</span></span></div>
+      <div class="row" style="margin-top:8px;"><span>Model R²</span><span class="val" style="color:var(--green)">0.95</span></div>
+    </div>
   </div>
-  <div class="ai-table-scroll" id="ai-table-scroll">
-    <table class="ai-table">
-      <thead><tr>
-        <th>timestamp</th>
-        <th>pv_voltage</th><th>pv_current</th><th>pv_power</th>
-        <th>pv_voltage_prev</th><th>pv_current_prev</th><th>pv_power_prev</th>
-        <th>Δpv_voltage</th><th>Δpv_current</th><th>Δpv_power</th>
-        <th>battery_voltage</th><th>battery_current</th><th>battery_power</th>
-        <th>battery_temperature</th>
-        <th>pwm_duty</th><th>pwm_frequency</th><th>pwm_duty_prev</th>
-        <th>lux</th><th>env_temperature</th>
-        <th>efficiency</th><th>power_loss</th>
-        <th>mppt_state</th><th>perturbation_direction</th><th>perturbation_step</th>
-        <th>elapsed_time_s</th><th>pv_energy_wh</th><th>battery_energy_wh</th>
-        <th>instant_efficiency</th><th>cumulative_efficiency</th>
-        <th>sample_valid</th><th>eff_suspicious</th><th>session_id</th>
-      </tr></thead>
-      <tbody id="ai-tbody"></tbody>
-    </table>
+
+  <!-- Top row: duty comparison + power side by side -->
+  <div class="charts-row" style="margin-bottom:8px;">
+    <div class="chart-box" style="margin-bottom:0;">
+      <h3>⟳ Actual Duty vs Predicted Optimal Duty</h3>
+      <canvas id="ch-ai-duty" height="120"></canvas>
+    </div>
+    <div class="chart-box" style="margin-bottom:0;">
+      <h3>☀ PV Power (W)</h3>
+      <canvas id="ch-ai-pwr" height="120"></canvas>
+    </div>
   </div>
-</div><!-- /ailogs -->
+
+  <!-- Bottom: Vmp history full width -->
+  <div class="chart-box" style="margin-bottom:8px;">
+    <h3>◈ Predicted Vmp vs Actual PV Voltage</h3>
+    <canvas id="ch-ai-vmp" height="90"></canvas>
+  </div>
+
+  <!-- Info card -->
+  <div class="card" style="padding:10px 12px;">
+    <div style="font-size:.75em;color:var(--text2);line-height:1.8;">
+      <b style="color:var(--cyan)">Cyan</b> = Predicted Vmp &nbsp;·&nbsp;
+      <b style="color:var(--purple)">Purple</b> = Predicted duty &nbsp;·&nbsp;
+      <b style="color:#00c8ff">Blue</b> = Actual P&O duty
+    </div>
+    <div style="font-size:.74em;margin-top:6px;line-height:1.7;border-top:1px solid var(--border);padding-top:6px;">
+      <span style="color:var(--cyan);font-weight:700;">MPPT</span> — Pure P&amp;O, AI runs in background for observation only, never influences duty<br>
+      <span style="color:var(--purple);font-weight:700;">Hybrid</span> — AI active: L1 seeds starting duty · L2 re-seeds after transients · guides P&amp;O direction &amp; step<br>
+      <span style="color:#34d399;font-weight:700;">Auto PWM</span> — Commercial CC-CV: Bulk (CC) → Absorption (CV) → Float (LiFePO4), AI observation only<br>
+      <span style="color:var(--text2);">In all modes: AI never writes to the PWM hardware register directly.</span>
+    </div>
+  </div>
+
+  <!-- Session summary (shown after charging stops) -->
+  <div class="card wfull" id="session-summary" style="display:none;border-color:rgba(0,200,255,.3);margin-top:8px;">
+    <div class="card-head"><span class="card-icon" style="color:var(--cyan)">◈</span><span class="card-title" style="color:var(--cyan)">Last Session Summary</span></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:4px;">
+      <div><div style="font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Duration</div><div class="big" style="font-size:1.2em;color:var(--text)" id="sum-duration">--</div></div>
+      <div><div style="font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Peak Power</div><div class="big" style="font-size:1.2em;color:var(--yellow)" id="sum-peak">--</div></div>
+      <div><div style="font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Energy (Bat)</div><div class="big" style="font-size:1.2em;color:var(--green)" id="sum-wh">--</div></div>
+      <div><div style="font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">Avg Efficiency</div><div class="big" style="font-size:1.2em;color:var(--purple)" id="sum-eff">--</div></div>
+      <div><div style="font-size:.65em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">AI Re-seeds (L2)</div><div class="big" style="font-size:1.2em;color:var(--cyan)" id="sum-reseeds">--</div></div>
+    </div>
+  </div>
+</div><!-- /aimonitor -->
 
 <!-- ── TAB: SETTINGS ── -->
 <div id="tab-settings" class="tab">
@@ -602,21 +645,16 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
       <div class="card-head"><span class="card-icon">⟲</span><span class="card-title">Charging Mode</span></div>
       <div style="margin-bottom:12px;">
         <div class="sel-lbl">Operating mode (locked while charging)</div>
-        <div style="display:flex;gap:8px;margin-top:8px;">
-          <button id="st-btn-mppt" class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('MPPT')">⟳ MPPT</button>
-          <button id="st-btn-pwm"  class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('PWM')">— Fixed PWM</button>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+          <button id="st-btn-mppt"     class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('MPPT')">⟳ MPPT</button>
+          <button id="st-btn-hybrid"   class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('HYBRID')">◈ Hybrid</button>
+          <button id="st-btn-pwm-auto" class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('PWM_AUTO')">⚡ Auto PWM</button>
         </div>
-      </div>
-      <div>
-        <div class="sel-lbl">Fixed PWM duty % (used only in Fixed PWM mode)</div>
-        <div style="display:flex;gap:8px;margin-top:6px;align-items:center;">
-          <input type="range" id="st-duty-slider" min="10" max="85" step="0.5" value="50"
-                 style="flex:1;accent-color:var(--yellow);"
-                 oninput="document.getElementById('st-duty-val').textContent=parseFloat(this.value).toFixed(1)+'%'">
-          <span id="st-duty-val" style="font-size:.9em;font-family:monospace;color:var(--yellow);min-width:48px;text-align:right;">50.0%</span>
-          <button class="btn btn-sm" onclick="doSetFixedDuty()">Set</button>
+        <div style="font-size:.71em;color:var(--muted);margin-top:5px;line-height:1.5;">
+          <b style="color:var(--cyan)">MPPT</b> — standard P&O, AI observation only &nbsp;·&nbsp;
+          <b style="color:var(--purple)">Hybrid</b> — AI guides P&O direction &amp; step &nbsp;·&nbsp;
+          <b style="color:#34d399">Auto PWM</b> — commercial CC-CV: Bulk → Absorption → Float (LiFePO4)
         </div>
-        <div style="font-size:.72em;color:var(--muted);margin-top:4px;">Range: 10–85 % &nbsp;·&nbsp; CC/CV limits still active</div>
       </div>
       <div class="ctrl-msg" id="st-mode-msg" style="margin-top:8px;"></div>
     </div>
@@ -680,16 +718,18 @@ if(!CanvasRenderingContext2D.prototype.roundRect){
 
 /* ── State ── */
 const HIST=150;
-const H={t:[],pvV:[],pvA:[],pvW:[],battV:[],battA:[],battW:[],duty:[],eff:[],pvWh:[],batWh:[],ceff:[]};
+const H={t:[],pvV:[],pvA:[],pvW:[],battV:[],battA:[],battW:[],duty:[],eff:[],pvWh:[],batWh:[],ceff:[],regPredDuty:[],regPredVmp:[]};
 const PVS=[]; // {v,p} P-V scatter
 let peakW=0,peakV=0,wasRun=false,busy=false,connected=false;
 let dashStart=Date.now(),lastStage='',lastConnected=null;
 let sessionStart=Date.now(),lastSessionId=-1;
 const LOGS=[];
-const AILOGS=[];
-let lastPerturbCount=-1;
-let aiPrev={pvV:0,pvA:0,pvW:0,duty:0};
 let lastState=null;
+// AI tracking state
+let aiRecentlyValid=0,prevRegValid=false;
+let vmpSessionStart=null,vmpTrackSid=-1;
+let aiVmpLive=null,aiVmpValid=false;
+let l2ReseedCount=0;
 
 function push(a,v){a.push(v);if(a.length>HIST)a.shift();}
 
@@ -899,6 +939,17 @@ function drawPVcurve(id){
   ctx.strokeStyle='#ffc10744';ctx.lineWidth=2;ctx.stroke();
   ctx.beginPath();ctx.arc(cpx,cpy,5,0,Math.PI*2);
   ctx.fillStyle='#ffc107';ctx.fill();
+  // AI predicted Vmp vertical line
+  if(aiVmpValid&&aiVmpLive>=vMin&&aiVmpLive<=vMax){
+    const vx=tx(aiVmpLive);
+    ctx.save();
+    ctx.strokeStyle='#22d3ee';ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
+    ctx.beginPath();ctx.moveTo(vx,pt);ctx.lineTo(vx,pt+ch);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#22d3ee';ctx.font='bold 9px monospace';ctx.textAlign='center';ctx.textBaseline='bottom';
+    ctx.fillText('AI Vmp',vx,pt-1);
+    ctx.restore();
+  }
 }
 
 /* ── Arc gauge (duty cycle) ── */
@@ -948,6 +999,10 @@ const charts=[
   new LChart('ch-eff',   [{label:'Efficiency %',color:'#9c6bff',key:'eff',unit:'%'}]),
   new LChart('ch-energy',[{label:'PV (Wh)',color:'#ffc107',key:'pvWh',unit:'Wh'},{label:'Battery (Wh)',color:'#00e676',key:'batWh',unit:'Wh'}]),
   new LChart('ch-ceff',  [{label:'Cumul. Eff %',color:'#00c8ff',key:'ceff',unit:'%'}]),
+  // AI Monitor charts
+  new LChart('ch-ai-duty',[{label:'P&O Duty %',color:'#00c8ff',key:'duty',unit:'%'},{label:'AI Pred Duty %',color:'#c084fc',key:'regPredDuty',unit:'%'}]),
+  new LChart('ch-ai-pwr', [{label:'PV Power (W)',color:'#ffc107',key:'pvW',unit:'W'}]),
+  new LChart('ch-ai-vmp', [{label:'Pred Vmp (V)',color:'#22d3ee',key:'regPredVmp',unit:'V'},{label:'PV Voltage (V)',color:'#4ade80',key:'pvV',unit:'V'}]),
 ];
 
 /* ── Render loop ── */
@@ -1011,7 +1066,8 @@ async function doCells(v){
 
 function setDisabled(d){
   ['btn-main','btn-mppt-start','btn-mppt-stop','btn-estop','bt-chem-sel','bt-cell-sel','st-chem-sel','st-cell-sel',
-   'btn-mode-pwm','btn-mode-mppt','st-btn-pwm','st-btn-mppt','st-duty-slider']
+   'btn-mode-mppt','btn-mode-hybrid','btn-mode-pwm-auto',
+   'st-btn-mppt','st-btn-hybrid','st-btn-pwm-auto']
     .forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=d;});
 }
 
@@ -1039,6 +1095,76 @@ async function refresh(){
     push(H.batWh,d.batteryEnergyWh||0);
     push(H.ceff, d.pvEnergyWh>0.001?d.cumulativeEfficiency:null);
 
+    // AI Monitor — regression history
+    push(H.regPredDuty, d.regValid && d.mpptRunning ? d.regPredDutyPct : null);
+    push(H.regPredVmp,  d.regValid && d.mpptRunning ? d.regPredVmpV   : null);
+
+    // AI state tracking
+    if(d.regValid) aiRecentlyValid=6; else if(aiRecentlyValid>0) aiRecentlyValid--;
+    if(d.regValid){aiVmpLive=d.regPredVmpV;aiVmpValid=true;}
+    if(!d.mpptRunning) aiVmpValid=false;
+    if(d.sessionId!==vmpTrackSid){vmpSessionStart=null;vmpTrackSid=d.sessionId;l2ReseedCount=0;}
+    if(d.regValid&&vmpSessionStart===null) vmpSessionStart=d.regPredVmpV;
+    // L2 re-seed: valid again after a transient gap while running
+    if(d.regValid&&!prevRegValid&&d.mpptRunning&&aiRecentlyValid<=1) l2ReseedCount++;
+    prevRegValid=d.regValid;
+
+    // AI Monitor stat cards
+    const aimVmp=document.getElementById('aim-vmp');
+    if(aimVmp){aimVmp.innerHTML=d.regValid?d.regPredVmpV.toFixed(2)+'<span class="big-unit">V</span>':'—<span class="big-unit">V</span>';aimVmp.style.color=d.regValid?'var(--cyan)':'var(--muted)';}
+    const aimPvv=document.getElementById('aim-pvv');
+    if(aimPvv) aimPvv.textContent=d.pvVoltage.toFixed(2)+'V';
+    // Vmp drift
+    const aimVmpDrift=document.getElementById('aim-vmp-drift');
+    if(aimVmpDrift){
+      if(d.regValid&&vmpSessionStart!==null){
+        const dr=d.regPredVmpV-vmpSessionStart;
+        aimVmpDrift.textContent=(dr>=0?'↑':'↓')+Math.abs(dr).toFixed(2)+' V from session start';
+        aimVmpDrift.style.color=Math.abs(dr)<0.3?'var(--text2)':'var(--yellow)';
+      }else{aimVmpDrift.textContent='—';aimVmpDrift.style.color='var(--muted)';}
+    }
+    const aimPredDuty=document.getElementById('aim-pred-duty');
+    if(aimPredDuty){aimPredDuty.innerHTML=d.regValid?d.regPredDutyPct.toFixed(1)+'<span class="big-unit">%</span>':'—<span class="big-unit">%</span>';aimPredDuty.style.color=d.regValid?'var(--purple)':'var(--muted)';}
+    const aimCurDuty=document.getElementById('aim-cur-duty');
+    if(aimCurDuty) aimCurDuty.textContent=d.dutyPercent.toFixed(1)+'%';
+    // Delta duty
+    const aimDeltaDuty=document.getElementById('aim-delta-duty');
+    if(aimDeltaDuty){
+      if(d.regValid){const dd=d.regPredDutyPct-d.dutyPercent;aimDeltaDuty.textContent=(dd>=0?'+':'')+dd.toFixed(1)+'%';aimDeltaDuty.style.color=Math.abs(dd)<2?'var(--green)':Math.abs(dd)<5?'var(--yellow)':'var(--red)';}
+      else{aimDeltaDuty.textContent='—';aimDeltaDuty.style.color='var(--muted)';}
+    }
+    const aimPvw=document.getElementById('aim-pvw');
+    if(aimPvw){aimPvw.innerHTML=d.pvPower.toFixed(2)+'<span class="big-unit">W</span>';}
+    const aimMode=document.getElementById('aim-mode');
+    if(aimMode) aimMode.textContent=d.operatingMode||'MPPT';
+    // Confidence badge (4 states)
+    const aimBadge=document.getElementById('aim-confidence-badge');
+    const aimStatus=document.getElementById('aim-status');
+    if(aimStatus){
+      let st,cls;
+      if(!d.mpptRunning){st='Idle';cls='';}
+      else if(d.regValid){st='Tracking';cls='ok';}
+      else if(aiRecentlyValid>0){st='Transient';cls='warn';}
+      else{st='Warming up';cls='';}
+      aimStatus.textContent=st;
+      if(aimBadge) aimBadge.className='badge'+(cls?' '+cls:'');
+    }
+    // Session summary
+    const sumCard=document.getElementById('session-summary');
+    if(sumCard){
+      if(!d.mpptRunning&&lastState&&lastState.mpptRunning){
+        const dur=Math.floor((Date.now()-sessionStart)/1000);
+        const hh=Math.floor(dur/3600),mm=Math.floor((dur%3600)/60),ss=dur%60;
+        document.getElementById('sum-duration').textContent=(hh>0?hh+'h ':'')+mm+'m '+ss+'s';
+        document.getElementById('sum-peak').textContent=peakW>0?peakW.toFixed(2)+' W':'--';
+        document.getElementById('sum-wh').textContent=(d.batteryEnergyWh||0).toFixed(3)+' Wh';
+        document.getElementById('sum-eff').textContent=d.pvEnergyWh>0.001?d.cumulativeEfficiency.toFixed(1)+'%':'--';
+        document.getElementById('sum-reseeds').textContent=l2ReseedCount;
+        sumCard.style.display='block';
+      }
+      if(d.mpptRunning) sumCard.style.display='none';
+    }
+
     // peak power
     if(d.mpptRunning&&d.pvPower>peakW){peakW=d.pvPower;peakV=d.pvVoltage;}
     if(d.mpptRunning&&!wasRun){peakW=0;peakV=0;}// new session
@@ -1054,39 +1180,6 @@ async function refresh(){
     if(d.chargeStage!==lastStage&&lastStage!==''){addLog('Stage → '+d.chargeStage,'ev-stage');}
     lastStage=d.chargeStage;
 
-    // ── AI Data Log — log on every P&O perturbation ──
-    if(d.mpptRunning && d.perturbCount!==lastPerturbCount){
-      if(lastPerturbCount>=0){
-        const aiEff=d.pvPower>0.05?Math.min(100,(d.batteryPower/d.pvPower)*100):null;
-        const elapsedS=((Date.now()-sessionStart)/1000).toFixed(1);
-        const row={
-          ts:new Date().toISOString(),
-          pvV:d.pvVoltage, pvA:d.pvCurrent, pvW:d.pvPower,
-          pvV0:aiPrev.pvV, pvA0:aiPrev.pvA, pvW0:aiPrev.pvW,
-          dV:d.pvVoltage-aiPrev.pvV, dA:d.pvCurrent-aiPrev.pvA, dW:d.pvPower-aiPrev.pvW,
-          batV:d.batteryVoltage, batA:d.batteryCurrent, batW:d.batteryPower,
-          batT:d.ntcValid?d.batteryTempC:null,
-          duty:d.dutyPercent, freq:20000, duty0:aiPrev.duty,
-          lux:d.tslSensorOk?d.lux:null,
-          envT:d.tmpSensorOk?d.temperature:null,
-          eff:aiEff, loss:d.pvPower-d.batteryPower,
-          state:d.chargeStage, dir:d.perturbDirection, step:0.25,
-          elapsed:elapsedS,
-          pvWh:d.pvEnergyWh||0, batWh:d.batteryEnergyWh||0,
-          ieff:d.efficiencyValid?d.instantEfficiency:null,
-          ceff:d.pvEnergyWh>0.001?d.cumulativeEfficiency:null,
-          valid:d.efficiencyValid, suspicious:d.effSuspicious||false,
-          sid:d.sessionId
-        };
-        AILOGS.push(row);
-        if(AILOGS.length>3000)AILOGS.shift();
-        appendAiRow(row);
-        document.getElementById('ai-count').textContent=AILOGS.length+' rows';
-        document.getElementById('ai-status').textContent='Last: '+new Date().toLocaleTimeString();
-      }
-      aiPrev={pvV:d.pvVoltage,pvA:d.pvCurrent,pvW:d.pvPower,duty:d.dutyPercent};
-      lastPerturbCount=d.perturbCount;
-    }
     lastState=d;
 
     // ── Session tracking ──
@@ -1114,27 +1207,27 @@ async function refresh(){
     stageEl.className=d.chargeStage==='Stopped'?'':
       d.chargeStage==='Ramping'?'ramp':
       d.chargeStage==='Bulk'?'bulk':
-      d.chargeStage==='Holding (CV)'?'hold':'run';
+      d.chargeStage==='Holding (CV)'?'hold':
+      d.chargeStage==='Float (CV)'?'run':'run';
     document.getElementById('t-msg').textContent=d.statusMessage||'';
 
     // ── Mode toggle sync ──
     if(d.operatingMode){
       const isMppt=d.operatingMode==='MPPT';
-      const bPwm=document.getElementById('btn-mode-pwm');
+      const isHybrid=d.operatingMode==='HYBRID';
+      const isPwmAuto=d.operatingMode==='PWM_AUTO';
       const bMppt=document.getElementById('btn-mode-mppt');
-      const sPwm=document.getElementById('st-btn-pwm');
+      const bHybrid=document.getElementById('btn-mode-hybrid');
+      const bPwmAuto=document.getElementById('btn-mode-pwm-auto');
       const sMppt=document.getElementById('st-btn-mppt');
-      if(bPwm){bPwm.className='mode-btn'+(isMppt?'':' m-pwm');bPwm.disabled=d.mpptRunning;}
+      const sHybrid=document.getElementById('st-btn-hybrid');
+      const sPwmAuto=document.getElementById('st-btn-pwm-auto');
       if(bMppt){bMppt.className='mode-btn'+(isMppt?' m-mppt':'');bMppt.disabled=d.mpptRunning;}
-      if(sPwm){sPwm.disabled=d.mpptRunning;sPwm.style.outline=!isMppt?'1px solid var(--yellow)':'';}
+      if(bHybrid){bHybrid.className='mode-btn'+(isHybrid?' m-hybrid':'');bHybrid.disabled=d.mpptRunning;}
+      if(bPwmAuto){bPwmAuto.className='mode-btn'+(isPwmAuto?' m-pwm-auto':'');bPwmAuto.disabled=d.mpptRunning;}
       if(sMppt){sMppt.disabled=d.mpptRunning;sMppt.style.outline=isMppt?'1px solid var(--cyan)':'';}
-      const sl=document.getElementById('st-duty-slider');
-      const sv=document.getElementById('st-duty-val');
-      if(sl&&document.activeElement!==sl){
-        if(d.fixedPwmDutyPercent>=10)sl.value=d.fixedPwmDutyPercent.toFixed(1);
-        sl.disabled=d.mpptRunning;
-      }
-      if(sv)sv.textContent=d.fixedPwmDutyPercent>=10?d.fixedPwmDutyPercent.toFixed(1)+'%':'Auto (feedforward)';
+      if(sHybrid){sHybrid.disabled=d.mpptRunning;sHybrid.style.outline=isHybrid?'1px solid var(--purple)':'';}
+      if(sPwmAuto){sPwmAuto.disabled=d.mpptRunning;sPwmAuto.style.outline=isPwmAuto?'1px solid #34d399':'';}
     }
 
     // ── Auto-restart toggle sync ──
@@ -1323,65 +1416,6 @@ async function refresh(){
   }
 }
 
-/* ── AI Data Log helpers ── */
-function appendAiRow(r){
-  const tbody=document.getElementById('ai-tbody');
-  const tr=document.createElement('tr');
-  const f=(v,d)=>v==null?'--':v.toFixed(d);
-  tr.innerHTML=
-    '<td>'+r.ts.replace('T',' ').slice(0,23)+'</td>'+
-    '<td>'+f(r.pvV,3)+'</td><td>'+f(r.pvA,3)+'</td><td>'+f(r.pvW,3)+'</td>'+
-    '<td>'+f(r.pvV0,3)+'</td><td>'+f(r.pvA0,3)+'</td><td>'+f(r.pvW0,3)+'</td>'+
-    '<td>'+f(r.dV,3)+'</td><td>'+f(r.dA,3)+'</td><td>'+f(r.dW,3)+'</td>'+
-    '<td>'+f(r.batV,3)+'</td><td>'+f(r.batA,3)+'</td><td>'+f(r.batW,3)+'</td>'+
-    '<td>'+(r.batT!=null?r.batT.toFixed(1):'--')+'</td>'+
-    '<td>'+f(r.duty,2)+'</td><td>'+r.freq+'</td><td>'+f(r.duty0,2)+'</td>'+
-    '<td>'+(r.lux!=null?r.lux.toFixed(0):'--')+'</td>'+
-    '<td>'+(r.envT!=null?r.envT.toFixed(1):'--')+'</td>'+
-    '<td>'+(r.eff!=null?r.eff.toFixed(1):'--')+'</td>'+
-    '<td>'+f(r.loss,3)+'</td>'+
-    '<td>'+r.state+'</td><td>'+(r.dir>0?'+1':'-1')+'</td><td>'+r.step+'</td>'+
-    '<td>'+r.elapsed+'</td>'+
-    '<td>'+f(r.pvWh,4)+'</td><td>'+f(r.batWh,4)+'</td>'+
-    '<td>'+(r.ieff!=null?r.ieff.toFixed(1):'--')+'</td>'+
-    '<td>'+(r.ceff!=null?r.ceff.toFixed(1):'--')+'</td>'+
-    '<td>'+(r.valid?'1':'0')+'</td>'+
-    '<td>'+(r.suspicious?'⚠':'0')+'</td>'+
-    '<td>'+r.sid+'</td>';
-  tbody.appendChild(tr);
-  const scr=document.getElementById('ai-table-scroll');
-  if(scr.scrollTop+scr.clientHeight>scr.scrollHeight-50)scr.scrollTop=scr.scrollHeight;
-}
-function exportAiCsv(){
-  const hdr='timestamp,pv_voltage,pv_current,pv_power,pv_voltage_prev,pv_current_prev,pv_power_prev,delta_pv_voltage,delta_pv_current,delta_pv_power,battery_voltage,battery_current,battery_power,battery_temperature,pwm_duty,pwm_frequency,pwm_duty_prev,light_visible,env_temperature,efficiency,power_loss,mppt_state,perturbation_direction,perturbation_step,elapsed_time_s,pv_energy_wh,battery_energy_wh,instant_efficiency,cumulative_efficiency,sample_valid,eff_suspicious,session_id';
-  const f=(v,d)=>v==null?'':v.toFixed(d);
-  const lines=[hdr,...AILOGS.map(r=>[
-    r.ts,f(r.pvV,4),f(r.pvA,4),f(r.pvW,4),
-    f(r.pvV0,4),f(r.pvA0,4),f(r.pvW0,4),
-    f(r.dV,4),f(r.dA,4),f(r.dW,4),
-    f(r.batV,4),f(r.batA,4),f(r.batW,4),
-    r.batT!=null?r.batT.toFixed(2):'',
-    f(r.duty,3),r.freq,f(r.duty0,3),
-    r.lux!=null?r.lux.toFixed(2):'',
-    r.envT!=null?r.envT.toFixed(2):'',
-    r.eff!=null?r.eff.toFixed(3):'',f(r.loss,4),
-    r.state,r.dir,r.step,
-    r.elapsed,f(r.pvWh,4),f(r.batWh,4),
-    r.ieff!=null?r.ieff.toFixed(2):'',
-    r.ceff!=null?r.ceff.toFixed(2):'',
-    r.valid?1:0, r.suspicious?1:0, r.sid
-  ].join(','))];
-  const blob=new Blob([lines.join('\n')],{type:'text/csv'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download='mppt-ai-data-'+new Date().toISOString().slice(0,10)+'.csv';a.click();
-}
-function clearAiLogs(){
-  AILOGS.length=0;lastPerturbCount=-1;
-  document.getElementById('ai-tbody').innerHTML='';
-  document.getElementById('ai-count').textContent='0 rows';
-  document.getElementById('ai-status').textContent='Cleared. Waiting for next session…';
-}
-
 async function doSetAutoRestart(enable){
   try{
     const r=await fetch('/autorestart?enable='+(enable?'1':'0'),{method:'POST'});
@@ -1404,18 +1438,6 @@ async function doSetMode(mode){
   await refresh();
 }
 
-async function doSetFixedDuty(){
-  const sl=document.getElementById('st-duty-slider');
-  if(!sl)return;
-  const duty=parseFloat(sl.value);
-  msgEl('st-mode-msg','Setting duty…');
-  try{
-    const r=await fetch('/fixedduty?duty='+duty.toFixed(1),{method:'POST'});
-    const d=await r.json();
-    if(d.ok){msgEl('st-mode-msg','');addLog('Fixed PWM duty set to '+duty.toFixed(1)+'%','ev-info');}
-    else{msgEl('st-mode-msg',d.reason||'Failed',true);}
-  }catch(e){msgEl('st-mode-msg','Connection error',true);}
-}
 
 async function doResetEnergy(){
   if(!confirm('Reset session energy counters? This cannot be undone.'))return;

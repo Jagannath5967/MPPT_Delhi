@@ -8,6 +8,9 @@
 #include <Adafruit_TMP117.h>
 #include <Adafruit_TSL2591.h>
 
+// Standalone Vmp predictor — no TFLite library required (observation only, never modifies hardware)
+#include "vmp_inference.h"
+
 // ---- Access Point credentials ----
 static const char *AP_SSID     = "MPPT-Dashboard";
 static const char *AP_PASSWORD = "mppt1234";  // must be 8+ chars, or "" for open network
@@ -58,8 +61,10 @@ Adafruit_TSL2591 tsl2591(2591);
 bool tmpSensorOk = false;
 bool tslSensorOk = false;
 
-float ambientTempC  = 0.0f;
-float luxValue      = 0.0f;
+float ambientTempC      = 0.0f;
+float luxValue          = 0.0f;
+float solarIrradianceWm2= 0.0f;
+constexpr float LUX_TO_IRRADIANCE = 120.0f;  // W/m² per lux, standard daylight conversion
 float batteryTempC  = 0.0f;
 bool  ntcValid      = false;
 
@@ -151,7 +156,7 @@ constexpr float BATTERY_FULL_TOLERANCE_V = 0.05f;
 // STAGE_RAMPING: rampCeilingVoltage still climbing (anti-inrush pacing, ~45s).
 // STAGE_BULK:    ceiling reached target but actual battery voltage still below it.
 // STAGE_HOLDING: actual battery voltage is near target -- true CV phase.
-enum ChargeStage { STAGE_STOPPED, STAGE_RAMPING, STAGE_BULK, STAGE_HOLDING };
+enum ChargeStage { STAGE_STOPPED, STAGE_RAMPING, STAGE_BULK, STAGE_HOLDING, STAGE_FLOAT };
 ChargeStage chargeStage = STAGE_STOPPED;
 float rampCeilingVoltage = 0.0f;
 float rampStepPerCycle   = 0.0f;
@@ -161,6 +166,7 @@ const char *chargeStageStr() {
     case STAGE_RAMPING: return "Ramping";
     case STAGE_BULK:    return "Bulk";
     case STAGE_HOLDING: return "Holding (CV)";
+    case STAGE_FLOAT:   return "Float (CV)";
     default:            return "Stopped";
   }
 }
@@ -175,12 +181,28 @@ enum StopType {
 constexpr unsigned long AUTO_RESTART_INTERVAL_MS = 30000;  // 30s between re-check attempts
 
 // ---- Operating mode ----
-// MODE_MPPT: P&O algorithm adjusts duty each step (default).
-// MODE_PWM:  Fixed duty reference; CC/CV limits still active for safety.
-enum OperatingMode { MODE_MPPT, MODE_PWM };
-// 0.0 = auto: compute feedforward at start (same as MPPT).
-// Any value >= MPPT_DUTY_MIN_PERCENT = user-set fixed duty.
-constexpr float PWM_FIXED_DUTY_AUTO = 0.0f;
+// MODE_MPPT:     Standard P&O, AI runs observation only, zero AI influence on duty.
+// MODE_HYBRID:   P&O guided by AI Vmp prediction — biased direction, variable step, convergence hold.
+// MODE_PWM_AUTO: Commercial CC-CV charger — Bulk (CC) → Absorption (CV) → Float (LiFePO4 only).
+enum OperatingMode { MODE_MPPT, MODE_HYBRID, MODE_PWM_AUTO };
+
+// ---- Auto PWM (CC-CV) constants ----
+constexpr float PWMCC_KP_CURRENT     = 0.25f;  // proportional gain: duty %  per Amp error
+constexpr float PWMCV_KP_VOLTAGE     = 0.30f;  // proportional gain: duty % per Volt error
+constexpr float PWMCC_MAX_STEP       = 0.5f;   // max duty correction per step (% pts)
+constexpr float PWM_TEMP_COMP_MV_CELL = 3.0f;  // mV/°C/cell temperature compensation for absorption
+constexpr float PWM_LIFEPO4_FLOAT_V_CELL = 3.35f;  // float target per cell (LiFePO4 only)
+constexpr float PWM_REBULK_HYST_V    = 0.30f;  // voltage drop below float to re-enter bulk
+
+// ---- Hybrid MPPT-AI constants ----
+// Far band  (|duty - AI_target| > NEAR_BAND): AI overrides P&O direction, large step.
+// Near band (HOLD_BAND < gap <= NEAR_BAND)  : P&O governs direction, fine step.
+// Hold band (gap <= HOLD_BAND + power stable): skip perturbation, hold duty.
+constexpr float HYBRID_STEP_FAR_PERCENT  = 0.50f;
+constexpr float HYBRID_STEP_NEAR_PERCENT = 0.10f;
+constexpr float HYBRID_NEAR_BAND_PERCENT = 2.0f;
+constexpr float HYBRID_HOLD_BAND_PERCENT = 0.5f;
+constexpr float HYBRID_HOLD_POWER_W      = 0.5f;  // max |ΔP| to allow hold
 
 WebServer server(80);
 
@@ -205,13 +227,25 @@ float previousPvPower = 0.0f;
 int8_t perturbDirection = 1;  // +1 = increasing duty, -1 = decreasing
 unsigned long lastMpptStep = 0;
 bool mpptRunning = false;
-OperatingMode operatingMode      = MODE_MPPT;
-float fixedPwmDutyPercent        = PWM_FIXED_DUTY_AUTO;  // 0 = auto on first start
+OperatingMode operatingMode = MODE_MPPT;
 uint32_t perturbCount = 0;  // increments every control step; dashboard uses it to detect new perturbations
 String lastStopReason = "Not started yet";
 StopType lastStopType       = STOP_USER;
 bool     autoRestartEnabled = false;
 unsigned long lastAutoStopTime = 0;
+
+// ---- Vmp predictor (observation only — never modifies PWM/P&O) ----
+// Model: Input(14)->Dense(32)->BN->ReLU->Dense(16)->BN->ReLU->Dense(8)->BN->ReLU->Dense(1,linear)
+// Weights and scalers embedded in vmp_inference.h — no TFLite runtime required.
+
+bool    regValid              = false;  // inference ran successfully this step
+float   regPredVmpV           = 0.0f;   // predicted Vmp (V) — observation only, never written to PWM
+float   regPredDutyPct        = 0.0f;   // feedforward duty derived from regPredVmpV — display only
+float   regPrevPvVoltage      = 0.0f;
+float   regPrevPvCurrent      = 0.0f;
+float   regPrevPvPower        = 0.0f;
+bool    vmpWasTransient       = false;  // set when inference skipped due to power spike
+bool    vmpTransientRecovery  = false;  // set for one tick after transient clears — triggers P&O re-seed
 
 // ---- Energy & efficiency measurement ----
 constexpr float ENERGY_MIN_POWER_W = 0.5f;  // min PV power for valid efficiency calculation
@@ -226,6 +260,7 @@ bool  efficiencyValid      = false;
 bool  effSuspicious        = false;
 uint32_t sessionId         = 0;
 float lastFeedforwardDutyPercent = 0.0f;
+float lastVmpEstimate            = 0.0f;
 unsigned long chargingStartTime = 0;
 bool hasSeenCurrentFlow = false;  // true once batteryCurrent > 0.1A this session
 
@@ -243,11 +278,25 @@ static inline bool isValidPower(float p) {
   return !isnan(p) && !isinf(p) && p >= -SENSOR_MAX_POWER_W && p <= SENSOR_MAX_POWER_W;
 }
 
+// Recover I2C bus if a previous timeout left SCL/SDA in a mid-transaction state.
+// Pings the TMP117 address; if it gets no ACK, reinits Wire to clear the lockup.
+static void recoverI2C(uint8_t probeAddr = TMP117_ADDRESS) {
+  Wire.beginTransmission(probeAddr);
+  if (Wire.endTransmission() != 0) {
+    Wire.end();
+    delay(2);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    Wire.setTimeOut(50);
+  }
+}
+
 // sampleAuxSensors: read TMP117 (temperature) and TSL2591 (light) at a reduced
 // rate (AUX_SAMPLE_INTERVAL_MS = 2s).  These are non-critical for the control
 // loop so they do NOT trigger a charge-stop on failure.
 void sampleAuxSensors() {
   if (tmpSensorOk) {
+    recoverI2C();
     sensors_event_t tempEvent;
     tmp117.getEvent(&tempEvent);
     float t = tempEvent.temperature;
@@ -256,12 +305,14 @@ void sampleAuxSensors() {
     }
   }
   if (tslSensorOk) {
+    recoverI2C(0x29);
     uint32_t lum  = tsl2591.getFullLuminosity();
     uint16_t ir   = lum >> 16;
     uint16_t full = lum & 0xFFFF;
     float lux     = tsl2591.calculateLux(full, ir);
     if (!isnan(lux) && !isinf(lux) && lux >= 0.0f && lux < 200000.0f) {
-      luxValue = lux;
+      luxValue           = lux;
+      solarIrradianceWm2 = lux / LUX_TO_IRRADIANCE;
     }
   }
 
@@ -542,12 +593,12 @@ float computeFeedforwardDutyPercent() {
   float vmpEstimate = PANEL_FOCV_RATIO * vocNow;
   float duty        = (batteryVoltage / vmpEstimate) * 100.0f;
 
-  if (duty > MPPT_DUTY_MAX_PERCENT) duty = MPPT_DUTY_MAX_PERCENT;
-  if (duty < MPPT_DUTY_MIN_PERCENT) duty = MPPT_DUTY_MIN_PERCENT;
+  duty = constrain(duty, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
 
   Serial.printf("Feedforward duty: Voc=%.2fV Vmp_est=%.2fV Vbatt=%.2fV -> duty=%.2f%%\n",
                 vocNow, vmpEstimate, batteryVoltage, duty);
   lastFeedforwardDutyPercent = duty;
+  lastVmpEstimate            = vmpEstimate;
   return duty;
 }
 
@@ -566,26 +617,37 @@ bool startCharging(String &errorOut) {
   }
 
   if (operatingMode == MODE_MPPT) {
+    // Pure P&O — FOCV feedforward only. AI has no involvement in MPPT mode.
     dutyPercent = computeFeedforwardDutyPercent();
-  } else {
-    // Fixed PWM: use user-set duty if one has been configured, otherwise
-    // fall back to the same feedforward estimate MPPT uses so the starting
-    // duty is always appropriate for the actual PV and battery voltages.
+  } else if (operatingMode == MODE_HYBRID) {
     float ff = computeFeedforwardDutyPercent();
-    if (fixedPwmDutyPercent < MPPT_DUTY_MIN_PERCENT) {
-      fixedPwmDutyPercent = ff;  // auto-compute and persist for the slider
+    // Level 1 (Hybrid only): AI replaces FOCV starting duty when model is warm.
+    if (regValid && regPredDutyPct >= MPPT_DUTY_MIN_PERCENT) {
+      Serial.printf("AI start (Hybrid L1): predicted duty %.2f%% (FOCV was %.2f%%)\n", regPredDutyPct, ff);
+      dutyPercent = regPredDutyPct;
+    } else {
+      dutyPercent = ff;
     }
-    dutyPercent = fixedPwmDutyPercent;
+  } else if (operatingMode == MODE_PWM_AUTO) {
+    // CC-CV auto: start low and ramp up under current control — no ramp stage needed.
+    dutyPercent = MPPT_DUTY_MIN_PERCENT;
   }
   previousPvPower  = 0.0f;
   perturbDirection = 1;
 
-  float fullV = batteryFullVoltage();
-  rampCeilingVoltage = batteryVoltage;
-  int totalSteps   = RAMP_DURATION_MS / MPPT_STEP_INTERVAL_MS;
-  rampStepPerCycle = (fullV - rampCeilingVoltage) / (float)totalSteps;
-  if (rampStepPerCycle < 0) rampStepPerCycle = 0;
-  chargeStage = STAGE_RAMPING;
+  if (operatingMode == MODE_PWM_AUTO) {
+    // Skip soft-start ramp — proportional CC controller handles inrush naturally.
+    rampCeilingVoltage = batteryFullVoltage();
+    rampStepPerCycle   = 0.0f;
+    chargeStage        = STAGE_BULK;
+  } else {
+    float fullV = batteryFullVoltage();
+    rampCeilingVoltage = batteryVoltage;
+    int totalSteps   = RAMP_DURATION_MS / MPPT_STEP_INTERVAL_MS;
+    rampStepPerCycle = (fullV - rampCeilingVoltage) / (float)totalSteps;
+    if (rampStepPerCycle < 0) rampStepPerCycle = 0;
+    chargeStage = STAGE_RAMPING;
+  }
 
   pwmSetDuty(dutyPercent);
   gatesResume();
@@ -597,6 +659,39 @@ bool startCharging(String &errorOut) {
   return true;
 }
 
+// ---- Shared charge-controller helpers ----------------------------------------
+
+// Advance the ramp ceiling one step toward full-charge voltage and update chargeStage.
+static void advanceRampAndStage() {
+  float fullV = batteryFullVoltage();
+  if (rampCeilingVoltage < fullV) {
+    rampCeilingVoltage = min(rampCeilingVoltage + rampStepPerCycle, fullV);
+  }
+  if (batteryVoltage >= fullV - BATTERY_FULL_TOLERANCE_V)
+    chargeStage = STAGE_HOLDING;
+  else if (rampCeilingVoltage >= fullV)
+    chargeStage = STAGE_BULK;
+}
+
+// Apply CC (current cap) and CV (voltage ceiling) limits to duty, then clamp to MPPT range.
+static void applyCC_CV(float &duty) {
+  if (batteryCurrent > MAX_CHARGE_CURRENT_A || batteryVoltage > rampCeilingVoltage)
+    duty -= CHARGE_CONTROL_CORRECTION_STEP_PERCENT;
+  duty = constrain(duty, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+}
+
+// Stop charging when all termination conditions are satisfied.
+static void checkTermination(const String &label) {
+  if (chargeStage != STAGE_HOLDING || !hasSeenCurrentFlow) return;
+  if (batteryVoltage >= batteryFullVoltage() - BATTERY_FULL_TOLERANCE_V &&
+      batteryCurrent <= TERMINATION_CURRENT_A &&
+      millis() - chargingStartTime >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
+    stopCharging("Charging complete -- battery full (" + label + ")", STOP_COMPLETE);
+  }
+}
+
+// ---- P&O and fixed-PWM controllers ------------------------------------------
+
 // Duty-cycle P&O MPPT: nudge duty in the direction that increased PV power last
 // step; reverse when power drops. Ramp ceiling and current cap are hard limits
 // layered on top -- P&O keeps running throughout (Option B).
@@ -604,98 +699,210 @@ bool startCharging(String &errorOut) {
 // pvPower is the global updated by sampleSensors() from INA260's native power
 // register. MPPT does not read sensors directly.
 void mpptStep() {
-  if (pvPower < previousPvPower) {
-    perturbDirection = -perturbDirection;
-  }
+  if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
 
-  dutyPercent += perturbDirection * MPPT_DUTY_STEP_PERCENT;
-  if (dutyPercent > MPPT_DUTY_MAX_PERCENT) dutyPercent = MPPT_DUTY_MAX_PERCENT;
-  if (dutyPercent < MPPT_DUTY_MIN_PERCENT) dutyPercent = MPPT_DUTY_MIN_PERCENT;
+  dutyPercent = constrain(dutyPercent + perturbDirection * MPPT_DUTY_STEP_PERCENT,
+                          MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
   previousPvPower = pvPower;
 
-  // Advance the ramp ceiling toward the full-charge target.
-  float fullV = batteryFullVoltage();
-  if (rampCeilingVoltage < fullV) {
-    rampCeilingVoltage += rampStepPerCycle;
-    if (rampCeilingVoltage > fullV) rampCeilingVoltage = fullV;
-  }
-
-  // Stage reflects where the ACTUAL battery voltage is relative to target.
-  if (batteryVoltage >= (fullV - BATTERY_FULL_TOLERANCE_V)) {
-    chargeStage = STAGE_HOLDING;
-  } else if (rampCeilingVoltage >= fullV) {
-    chargeStage = STAGE_BULK;
-  }
-
-  // CC: battery current cap -- takes priority over voltage ceiling.
-  // CV: voltage ceiling -- keeps battery voltage below the ramp ceiling.
-  if (batteryCurrent > MAX_CHARGE_CURRENT_A) {
-    dutyPercent -= CHARGE_CONTROL_CORRECTION_STEP_PERCENT;
-  } else if (batteryVoltage > rampCeilingVoltage) {
-    dutyPercent -= CHARGE_CONTROL_CORRECTION_STEP_PERCENT;
-  }
-  if (dutyPercent > MPPT_DUTY_MAX_PERCENT) dutyPercent = MPPT_DUTY_MAX_PERCENT;
-  if (dutyPercent < MPPT_DUTY_MIN_PERCENT) dutyPercent = MPPT_DUTY_MIN_PERCENT;
-
+  advanceRampAndStage();
+  applyCC_CV(dutyPercent);
   pwmSetDuty(dutyPercent);
   perturbCount++;
 
-  // Track once real current has been seen this session.
   if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
-
-  // Termination: at target voltage, current tapered below C/20, current was
-  // actually observed flowing, and minimum runtime has elapsed (prevents
-  // false termination during EMA settling at startup).
-  if (chargeStage == STAGE_HOLDING &&
-      hasSeenCurrentFlow &&
-      batteryVoltage >= (fullV - BATTERY_FULL_TOLERANCE_V) &&
-      batteryCurrent <= TERMINATION_CURRENT_A &&
-      (millis() - chargingStartTime) >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
-    stopCharging("Charging complete -- battery full (" + String(CHEMISTRY_NAMES[selectedChemistry]) + ")", STOP_COMPLETE);
-  }
+  checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
 }
 
-// Fixed-duty controller: applies fixedPwmDutyPercent as the duty reference
-// but still enforces CC/CV limits and all charge-stage logic.
-// The P&O perturbation is absent — duty stays constant unless a safety limit
-// forces a reduction.
-void fixedPwmStep() {
-  float duty = fixedPwmDutyPercent;
+// Hybrid P&O + AI controller.
+// Three operating zones based on distance from AI's predicted optimal duty:
+//
+//  Far  (gap > NEAR_BAND): AI overrides perturbDirection toward target, large step.
+//  Near (HOLD_BAND < gap <= NEAR_BAND): P&O governs direction normally, fine step.
+//  Hold (gap <= HOLD_BAND AND |ΔP| < threshold): skip perturbation, stay at current duty.
+//
+// Falls back to standard P&O (MPPT_DUTY_STEP_PERCENT) when regValid is false.
+void hybridStep() {
+  float step = MPPT_DUTY_STEP_PERCENT;  // default: full P&O step
 
-  float fullV = batteryFullVoltage();
-  if (rampCeilingVoltage < fullV) {
-    rampCeilingVoltage += rampStepPerCycle;
-    if (rampCeilingVoltage > fullV) rampCeilingVoltage = fullV;
+  if (regValid) {
+    const float diff    = regPredDutyPct - dutyPercent;
+    const float absDiff = fabsf(diff);
+
+    // Hold zone: AI is confident, duty is close, and power is stable.
+    if (absDiff <= HYBRID_HOLD_BAND_PERCENT &&
+        fabsf(pvPower - previousPvPower) < HYBRID_HOLD_POWER_W) {
+      previousPvPower = pvPower;
+      advanceRampAndStage();
+      applyCC_CV(dutyPercent);
+      pwmSetDuty(dutyPercent);
+      perturbCount++;
+      if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
+      checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
+      return;
+    }
+
+    if (absDiff > HYBRID_NEAR_BAND_PERCENT) {
+      // Far zone: AI overrides direction, accelerate toward AI target.
+      perturbDirection = (diff > 0.0f) ? 1 : -1;
+      step = HYBRID_STEP_FAR_PERCENT;
+    } else {
+      // Near zone: P&O governs direction via power gradient, fine step.
+      if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+      step = HYBRID_STEP_NEAR_PERCENT;
+    }
+  } else {
+    // AI not valid — pure P&O fallback with standard step.
+    if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
   }
 
-  if (batteryVoltage >= (fullV - BATTERY_FULL_TOLERANCE_V)) {
-    chargeStage = STAGE_HOLDING;
-  } else if (rampCeilingVoltage >= fullV) {
-    chargeStage = STAGE_BULK;
-  }
+  dutyPercent = constrain(dutyPercent + perturbDirection * step,
+                          MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+  previousPvPower = pvPower;
 
-  // CC/CV regulation overrides fixed duty when limits are hit.
-  if (batteryCurrent > MAX_CHARGE_CURRENT_A) {
-    duty -= CHARGE_CONTROL_CORRECTION_STEP_PERCENT;
-  } else if (batteryVoltage > rampCeilingVoltage) {
-    duty -= CHARGE_CONTROL_CORRECTION_STEP_PERCENT;
+  advanceRampAndStage();
+  applyCC_CV(dutyPercent);
+  pwmSetDuty(dutyPercent);
+  perturbCount++;
+  if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
+  checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
+}
+
+// ---- Auto PWM (commercial CC-CV) helpers ------------------------------------
+
+// Temperature-compensated absorption voltage.
+// Reduces absorption target by 3mV/°C/cell above 25°C to prevent overcharging hot packs.
+float pwmAbsorbVoltage() {
+  float base = batteryFullVoltage();
+  if (ntcValid && batteryTempC > 25.0f) {
+    float comp = (batteryTempC - 25.0f) * (PWM_TEMP_COMP_MV_CELL / 1000.0f) * selectedCellCount;
+    base -= comp;
   }
-  if (duty > MPPT_DUTY_MAX_PERCENT) duty = MPPT_DUTY_MAX_PERCENT;
-  if (duty < MPPT_DUTY_MIN_PERCENT) duty = MPPT_DUTY_MIN_PERCENT;
+  return base;
+}
+
+// Float target: only used for LiFePO4. Returns 0 for other chemistries (no float stage).
+float pwmFloatVoltage() {
+  if (selectedChemistry != CHEM_LIFEPO4) return 0.0f;
+  return PWM_LIFEPO4_FLOAT_V_CELL * selectedCellCount;
+}
+
+// Commercial CC-CV controller:
+//   BULK    (STAGE_BULK)   : proportional current control to MAX_CHARGE_CURRENT_A.
+//   HOLDING (STAGE_HOLDING): proportional voltage control to absorption target; exit at C/20.
+//   FLOAT   (STAGE_FLOAT)  : proportional voltage control to float target (LiFePO4 only);
+//                            re-bulk if voltage droops below float − PWM_REBULK_HYST_V.
+void pwmAutoStep() {
+  float duty = dutyPercent;
+
+  if (chargeStage == STAGE_FLOAT) {
+    float floatV = pwmFloatVoltage();
+    // Re-bulk if battery draws significantly below float (load pulling it down).
+    if (batteryVoltage < floatV - PWM_REBULK_HYST_V) {
+      chargeStage = STAGE_BULK;
+      Serial.println("PWM_AUTO: voltage droop — re-entering Bulk");
+    } else {
+      float err  = floatV - batteryVoltage;
+      float corr = constrain(PWMCV_KP_VOLTAGE * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+      duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+    }
+  } else if (chargeStage == STAGE_HOLDING) {
+    float absorbV = pwmAbsorbVoltage();
+    float err     = absorbV - batteryVoltage;
+    float corr    = constrain(PWMCV_KP_VOLTAGE * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+    duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+
+    // Transition to Float (LiFePO4) or terminate (others) at C/20.
+    if (hasSeenCurrentFlow &&
+        batteryVoltage >= absorbV - BATTERY_FULL_TOLERANCE_V &&
+        batteryCurrent <= TERMINATION_CURRENT_A &&
+        millis() - chargingStartTime >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
+      if (pwmFloatVoltage() > 0.0f) {
+        chargeStage = STAGE_FLOAT;
+        Serial.println("PWM_AUTO: absorption complete — entering Float");
+      } else {
+        stopCharging("Charging complete — battery full (" +
+                     String(CHEMISTRY_NAMES[selectedChemistry]) + ")", STOP_COMPLETE);
+        return;
+      }
+    }
+  } else {
+    // BULK (CC): proportional current control toward MAX_CHARGE_CURRENT_A.
+    float err  = MAX_CHARGE_CURRENT_A - batteryCurrent;
+    float corr = constrain(PWMCC_KP_CURRENT * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+    duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+
+    // Transition to Absorption when battery reaches absorption voltage.
+    if (batteryVoltage >= pwmAbsorbVoltage() - BATTERY_FULL_TOLERANCE_V) {
+      chargeStage = STAGE_HOLDING;
+      Serial.println("PWM_AUTO: target voltage reached — entering Absorption (CV)");
+    }
+  }
 
   pwmSetDuty(duty);
   perturbCount++;
-
   if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
+}
 
-  if (chargeStage == STAGE_HOLDING &&
-      hasSeenCurrentFlow &&
-      batteryVoltage >= (fullV - BATTERY_FULL_TOLERANCE_V) &&
-      batteryCurrent <= TERMINATION_CURRENT_A &&
-      (millis() - chargingStartTime) >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
-    stopCharging("Charging complete -- battery full (Fixed PWM mode, " +
-                 String(CHEMISTRY_NAMES[selectedChemistry]) + ")", STOP_COMPLETE);
+// Vmp predictor — observation only, no hardware access.
+// 14 raw features → predicted Vmp (V). vmpForwardPass() normalises internally.
+void runVmpInference() {
+  if (!pvSensorOk || !battSensorOk) { regValid = false; return; }
+
+  const float dPvPower = pvPower - regPrevPvPower;
+
+  // Feature order must match vmp_scaler.json exactly (14 features):
+  const float feat[VMP_N_FEATURES] = {
+    pvVoltage,                                                       // pv_voltage_V
+    pvCurrent,                                                       // pv_current_A
+    pvPower,                                                         // pv_power_W
+    batteryVoltage,                                                  // battery_voltage_V
+    batteryCurrent,                                                  // battery_current_A
+    luxValue,                                                        // lux
+    ambientTempC,                                                    // panel_temperature_C
+    dutyPercent,                                                     // duty_cycle_pct
+    pvVoltage - regPrevPvVoltage,                                    // delta_pv_voltage_V
+    dPvPower,                                                        // delta_pv_power_W
+    fabsf(dPvPower),                                                 // abs_delta_pv_power
+    dPvPower > 0.0f ? 1.0f : (dPvPower < 0.0f ? -1.0f : 0.0f),    // power_change_sign
+    pvCurrent - regPrevPvCurrent,                                    // delta_pv_current_A
+    (float)chargeStage                                               // mppt_state_code
+  };
+
+  regPrevPvVoltage = pvVoltage;
+  regPrevPvCurrent = pvCurrent;
+  regPrevPvPower   = pvPower;
+
+  // Skip on transient spikes — mark for Level 2 recovery on the next valid step.
+  if (fabsf(dPvPower) > 2.0f) {
+    vmpWasTransient = true;
+    regValid = false;
+    return;
   }
+
+  float out[1];
+  vmpForwardPass(feat, out);   // normalises internally; out[0] = predicted Vmp (V)
+
+  const float vmp = out[0];
+
+  // Reject predictions outside the model's training range (10–20 V).
+  if (vmp < 10.0f || vmp > 20.0f) { regValid = false; return; }
+
+  regPredVmpV = vmp;
+
+  // Feedforward duty: duty = Vbat / (0.95 × Vmp) × 100
+  // 0.95 = assumed buck efficiency — accounts for ~5% conversion loss.
+  // OBSERVATION ONLY — never written to PWM directly; used only as a P&O seed.
+  regPredDutyPct = constrain((batteryVoltage / (0.95f * vmp)) * 100.0f,
+                             MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+
+  // Signal transient recovery for serviceCharger() to act on this tick.
+  if (vmpWasTransient) {
+    vmpTransientRecovery = true;
+    vmpWasTransient = false;
+  }
+
+  regValid = true;
 }
 
 void checkAutoRestart() {
@@ -728,11 +935,22 @@ void serviceCharger() {
   unsigned long now = millis();
   if (now - lastMpptStep >= MPPT_STEP_INTERVAL_MS) {
     lastMpptStep = now;
-    if (operatingMode == MODE_MPPT) {
-      mpptStep();
-    } else {
-      fixedPwmStep();
+    runVmpInference();
+
+    // Level 2 (Hybrid only): re-seed from AI predicted duty after a power transient clears.
+    // MPPT is pure P&O — no AI re-seeding there.
+    if (vmpTransientRecovery && operatingMode == MODE_HYBRID && regValid) {
+      Serial.printf("AI re-seed after transient: %.2f%% -> %.2f%%\n",
+                    dutyPercent, regPredDutyPct);
+      dutyPercent     = regPredDutyPct;
+      previousPvPower = 0.0f;
+      vmpTransientRecovery = false;
     }
+    vmpTransientRecovery = false;
+
+    if      (operatingMode == MODE_MPPT)     mpptStep();
+    else if (operatingMode == MODE_HYBRID)   hybridStep();
+    else if (operatingMode == MODE_PWM_AUTO) pwmAutoStep();
   }
 }
 
@@ -750,7 +968,7 @@ static const char *jsonEscape(const String &s, char *out, size_t outLen) {
 }
 
 void handleState() {
-  static char buf[1600];
+  static char buf[1900];
   static char escapedMsg[256];
   float fullV = batteryFullVoltage();
   jsonEscape(lastStopReason, escapedMsg, sizeof(escapedMsg));
@@ -769,6 +987,7 @@ void handleState() {
     "\"mpptRunning\":%s,"
     "\"minStartVoltage\":%.2f,"
     "\"feedforwardDutyPercent\":%.2f,"
+    "\"referenceVmpV\":%.3f,"
     "\"statusMessage\":\"%s\","
     "\"chemistry\":%d,"
     "\"chemistryName\":\"%s\","
@@ -789,6 +1008,7 @@ void handleState() {
     "\"tslSensorOk\":%s,"
     "\"temperature\":%.2f,"
     "\"lux\":%.1f,"
+    "\"irradiance\":%.2f,"
     "\"batteryTempC\":%.2f,"
     "\"ntcValid\":%s,"
     "\"perturbCount\":%u,"
@@ -800,10 +1020,12 @@ void handleState() {
     "\"effSuspicious\":%s,"
     "\"sessionId\":%u,"
     "\"operatingMode\":\"%s\","
-    "\"fixedPwmDutyPercent\":%.2f,"
     "\"autoRestartEnabled\":%s,"
     "\"autoRestartEligible\":%s,"
-    "\"autoRestartCountdown\":%u"
+    "\"autoRestartCountdown\":%u,"
+    "\"regValid\":%s,"
+    "\"regPredVmpV\":%.3f,"
+    "\"regPredDutyPct\":%.2f"
     "}",
     pvVoltage, pvCurrent, pvPower,
     batteryVoltage, batteryCurrent, batteryPower,
@@ -812,6 +1034,7 @@ void handleState() {
     mpptRunning ? "true" : "false",
     fullV + MPPT_MIN_PV_HEADROOM_START_V,
     lastFeedforwardDutyPercent,
+    lastVmpEstimate,
     escapedMsg,
     (int)selectedChemistry,
     CHEMISTRY_NAMES[selectedChemistry],
@@ -829,6 +1052,7 @@ void handleState() {
     tslSensorOk  ? "true" : "false",
     ambientTempC,
     luxValue,
+    solarIrradianceWm2,
     batteryTempC,
     ntcValid ? "true" : "false",
     perturbCount,
@@ -838,15 +1062,19 @@ void handleState() {
     efficiencyValid  ? "true" : "false",
     effSuspicious    ? "true" : "false",
     sessionId,
-    operatingMode == MODE_MPPT ? "MPPT" : "PWM",
-    fixedPwmDutyPercent,
+    operatingMode == MODE_MPPT ? "MPPT" :
+      operatingMode == MODE_HYBRID   ? "HYBRID" :
+      operatingMode == MODE_PWM_AUTO ? "PWM_AUTO" : "MPPT",
     autoRestartEnabled ? "true" : "false",
     (lastStopType == STOP_AUTO_PV) ? "true" : "false",
     (!mpptRunning && autoRestartEnabled && lastStopType == STOP_AUTO_PV)
       ? (millis() - lastAutoStopTime >= AUTO_RESTART_INTERVAL_MS
           ? 0u
           : (uint32_t)((AUTO_RESTART_INTERVAL_MS - (millis() - lastAutoStopTime)) / 1000))
-      : 0u
+      : 0u,
+    regValid         ? "true" : "false",
+    regPredVmpV,
+    regPredDutyPct
   );
   server.send(200, "application/json", buf);
 }
@@ -903,16 +1131,7 @@ void handleSetCellCount() {
 }
 
 void handleResetEnergy() {
-  pvEnergyWh           = 0.0f;
-  batteryEnergyWh      = 0.0f;
-  pvPowerPrev          = pvPower;
-  battPowerPrev        = batteryPower;
-  lastEnergyTime       = millis();
-  instantEfficiency    = 0.0f;
-  cumulativeEfficiency = 0.0f;
-  efficiencyValid      = false;
-  effSuspicious        = false;
-  sessionId++;
+  resetEnergySession();
   Serial.println("Energy session reset by dashboard");
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -941,32 +1160,15 @@ void handleSetMode() {
   if (m == "MPPT") {
     operatingMode = MODE_MPPT;
     server.send(200, "application/json", "{\"ok\":true,\"mode\":\"MPPT\"}");
-  } else if (m == "PWM") {
-    operatingMode = MODE_PWM;
-    server.send(200, "application/json", "{\"ok\":true,\"mode\":\"PWM\"}");
+  } else if (m == "HYBRID") {
+    operatingMode = MODE_HYBRID;
+    server.send(200, "application/json", "{\"ok\":true,\"mode\":\"HYBRID\"}");
+  } else if (m == "PWM_AUTO") {
+    operatingMode = MODE_PWM_AUTO;
+    server.send(200, "application/json", "{\"ok\":true,\"mode\":\"PWM_AUTO\"}");
   } else {
-    server.send(400, "application/json", "{\"ok\":false,\"reason\":\"Invalid mode (use MPPT or PWM)\"}");
+    server.send(400, "application/json", "{\"ok\":false,\"reason\":\"Invalid mode (use MPPT, HYBRID, or PWM_AUTO)\"}");
   }
-}
-
-void handleSetFixedDuty() {
-  if (mpptRunning) {
-    server.send(200, "application/json", "{\"ok\":false,\"reason\":\"Stop charging before changing fixed duty\"}");
-    return;
-  }
-  if (!server.hasArg("duty")) {
-    server.send(400, "application/json", "{\"ok\":false,\"reason\":\"Missing duty parameter\"}");
-    return;
-  }
-  float d = server.arg("duty").toFloat();
-  if (d < PWM_DUTY_HARD_MIN_PERCENT || d > PWM_DUTY_HARD_MAX_PERCENT) {
-    server.send(200, "application/json", "{\"ok\":false,\"reason\":\"Duty out of range ("
-                + String(PWM_DUTY_HARD_MIN_PERCENT, 0) + "–"
-                + String(PWM_DUTY_HARD_MAX_PERCENT, 0) + "%)\"}");
-    return;
-  }
-  fixedPwmDutyPercent = d;
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleNotFound() {
@@ -1060,10 +1262,10 @@ void setup() {
   server.on("/resetenergy",  HTTP_POST, handleResetEnergy);
   server.on("/autorestart",  HTTP_POST, handleSetAutoRestart);
   server.on("/mode",         HTTP_POST, handleSetMode);
-  server.on("/fixedduty",    HTTP_POST, handleSetFixedDuty);
   server.onNotFound(handleNotFound);
   server.begin();
 
+  Serial.println("AI: Regression model ready (observation only)");
   sampleSensors();  // seed EMA from real readings before loop starts
   pwmInit(MPPT_DUTY_START_PERCENT);
   gatesForceOff();  // boot in off state -- PWM starts only when Start is pressed
