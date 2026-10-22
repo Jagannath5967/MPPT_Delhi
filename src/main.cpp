@@ -67,9 +67,25 @@ float solarIrradianceWm2= 0.0f;
 constexpr float LUX_TO_IRRADIANCE = 120.0f;  // W/m² per lux, standard daylight conversion
 float batteryTempC  = 0.0f;
 bool  ntcValid      = false;
+bool  cloudyCondition  = false;
+
+// HYB-AIMLSL per-zone enable flags (all on by default)
+bool hybZoneFarEnabled  = true;
+bool hybZoneNearEnabled = true;
+bool hybZoneHoldEnabled = true;
 
 constexpr unsigned long AUX_SAMPLE_INTERVAL_MS = 2000;
-unsigned long lastAuxSample = 0;
+
+// ---- Cloudy condition detector ----
+// Detects a passing cloud by relative drop from a live sunny baseline.
+// Both PV power and irradiance (TSL2591) contribute via OR logic.
+constexpr float         CLOUDY_PV_DROP_FRAC   = 0.35f;  // 35% drop in PV power  → triggers
+constexpr float         CLOUDY_IRR_DROP_FRAC  = 0.35f;  // 35% drop in irradiance → triggers
+constexpr float         CLOUDY_BASELINE_ALPHA = 0.05f;  // EMA rate for baseline (~40 s to settle)
+constexpr float         CLOUDY_MIN_PV_W       = 3.0f;   // panel must produce ≥3 W for detection
+constexpr float         CLOUDY_MIN_IRR_WM2    = 50.0f;  // irradiance must be ≥50 W/m² for detection
+constexpr unsigned long CLOUDY_CONFIRM_MS     = 5000;   // drop must persist this long to confirm
+constexpr unsigned long CLOUDY_CLEAR_MS       = 5000;   // recovery must persist this long to clear
 
 // Sensor output validation bounds
 constexpr float SENSOR_MAX_VOLTAGE_V = 40.0f;   // headroom over 3S LiHV full (13.05V) and panel Voc (22V)
@@ -181,7 +197,7 @@ enum StopType {
 constexpr unsigned long AUTO_RESTART_INTERVAL_MS = 30000;  // 30s between re-check attempts
 
 // ---- Operating mode ----
-// MODE_MPPT:     Standard P&O, AI runs observation only, zero AI influence on duty.
+// MODE_MPPT:     Adaptive P&O — variable step size + full CC-CV stage machine (Bulk → Absorption → Float).
 // MODE_HYBRID:   P&O guided by AI Vmp prediction — biased direction, variable step, convergence hold.
 // MODE_PWM_AUTO: Commercial CC-CV charger — Bulk (CC) → Absorption (CV) → Float (LiFePO4 only).
 enum OperatingMode { MODE_MPPT, MODE_HYBRID, MODE_PWM_AUTO };
@@ -204,6 +220,9 @@ constexpr float HYBRID_NEAR_BAND_PERCENT = 2.0f;
 constexpr float HYBRID_HOLD_BAND_PERCENT = 0.5f;
 constexpr float HYBRID_HOLD_POWER_W      = 0.5f;  // max |ΔP| to allow hold
 
+
+constexpr float CURRENT_FLOW_DETECT_A = 0.1f; // minimum current to flag hasSeenCurrentFlow
+
 WebServer server(80);
 
 // Filtered measurement outputs consumed by CC/CV/MPPT
@@ -214,7 +233,6 @@ float batteryVoltage = 0.0f;
 float batteryCurrent = 0.0f;
 float batteryPower   = 0.0f;   // from INA260 native power register
 
-unsigned long lastSensorSample = 0;
 
 // Pre-filter values exposed on the dashboard sensor debug card
 float rawPvVoltage   = 0.0f;
@@ -241,10 +259,6 @@ unsigned long lastAutoStopTime = 0;
 bool    regValid              = false;  // inference ran successfully this step
 float   regPredVmpV           = 0.0f;   // predicted Vmp (V) — observation only, never written to PWM
 float   regPredDutyPct        = 0.0f;   // feedforward duty derived from regPredVmpV — display only
-float   regPrevPvVoltage      = 0.0f;
-float   regPrevPvCurrent      = 0.0f;
-float   regPrevPvPower        = 0.0f;
-bool    vmpWasTransient       = false;  // set when inference skipped due to power spike
 bool    vmpTransientRecovery  = false;  // set for one tick after transient clears — triggers P&O re-seed
 
 // ---- Energy & efficiency measurement ----
@@ -500,7 +514,78 @@ void sampleSensors() {
   batteryPower   = battPowFiltered;
 }
 
+// Dual-sensor cloud detector using relative drop from a live sunny baseline.
+//
+// Baseline: slow EMA of pvPower and irradiance, updated only while confirmed clear
+// and charger is running. Freezes when cloudy so a long cloud doesn't erode the reference.
+//
+// Trigger (OR logic): either PV power OR irradiance drops >35% below its baseline.
+// This handles TSL2591-absent hardware gracefully — pvPower alone is sufficient.
+//
+// Hysteresis: drop must persist CLOUDY_CONFIRM_MS; recovery must persist CLOUDY_CLEAR_MS.
+void updateCloudyDetector() {
+  static float         cloudPvBaseline  = 0.0f;
+  static float         cloudIrrBaseline = 0.0f;
+  static unsigned long cloudyStartMs = 0;
+  static unsigned long clearStartMs  = 0;
+  unsigned long now = millis();
+
+  if (!mpptRunning) {
+    cloudyStartMs = 0;
+    clearStartMs  = 0;
+    return;
+  }
+
+  // Update baselines only while confirmed clear, so a prolonged cloud doesn't drift them down.
+  if (!cloudyCondition) {
+    if (pvPower > CLOUDY_MIN_PV_W)
+      cloudPvBaseline = cloudPvBaseline * (1.0f - CLOUDY_BASELINE_ALPHA)
+                        + pvPower * CLOUDY_BASELINE_ALPHA;
+    if (tslSensorOk && solarIrradianceWm2 > CLOUDY_MIN_IRR_WM2)
+      cloudIrrBaseline = cloudIrrBaseline * (1.0f - CLOUDY_BASELINE_ALPHA)
+                         + solarIrradianceWm2 * CLOUDY_BASELINE_ALPHA;
+  }
+
+  // Trigger: significant relative drop from established baseline on either sensor.
+  const bool pvLow  = (cloudPvBaseline  > CLOUDY_MIN_PV_W    &&
+                        pvPower          < cloudPvBaseline  * (1.0f - CLOUDY_PV_DROP_FRAC));
+  const bool irrLow = (tslSensorOk &&
+                        cloudIrrBaseline > CLOUDY_MIN_IRR_WM2 &&
+                        solarIrradianceWm2 < cloudIrrBaseline * (1.0f - CLOUDY_IRR_DROP_FRAC));
+  const bool lowLight = pvLow || irrLow;
+
+  if (!cloudyCondition) {
+    if (lowLight) {
+      if (cloudyStartMs == 0) cloudyStartMs = now;
+      if (now - cloudyStartMs >= CLOUDY_CONFIRM_MS) {
+        cloudyCondition = true;
+        cloudyStartMs   = 0;
+        clearStartMs    = 0;
+        Serial.printf("CLOUD: confirmed — pv=%.1fW (ref=%.1fW)  irr=%.0f W/m² (ref=%.0f W/m²)\n",
+                      pvPower, cloudPvBaseline, solarIrradianceWm2, cloudIrrBaseline);
+      }
+    } else {
+      cloudyStartMs = 0;
+    }
+  } else {
+    if (!lowLight) {
+      if (clearStartMs == 0) clearStartMs = now;
+      if (now - clearStartMs >= CLOUDY_CLEAR_MS) {
+        cloudyCondition = false;
+        clearStartMs    = 0;
+        cloudyStartMs   = 0;
+        Serial.printf("CLOUD: cleared  — pv=%.1fW (ref=%.1fW)  irr=%.0f W/m² (ref=%.0f W/m²)\n",
+                      pvPower, cloudPvBaseline, solarIrradianceWm2, cloudIrrBaseline);
+      }
+    } else {
+      clearStartMs = 0;
+    }
+  }
+}
+
 void serviceSensors() {
+  static unsigned long lastSensorSample = 0;
+  static unsigned long lastAuxSample    = 0;
   unsigned long now = millis();
   if (now - lastSensorSample >= SENSOR_SAMPLE_INTERVAL_MS) {
     lastSensorSample = now;
@@ -527,6 +612,7 @@ void serviceSensors() {
   if (now - lastAuxSample >= AUX_SAMPLE_INTERVAL_MS) {
     lastAuxSample = now;
     sampleAuxSensors();
+    updateCloudyDetector();
   }
 }
 
@@ -565,17 +651,24 @@ void forcePinsLowRaw() {
   digitalWrite(PWM_LOW_SIDE_PIN, LOW);
 }
 
+// Stop MCPWM and force both IR2101 gate signals low.
+// Calling mcpwm_stop alone leaves the last duty on the output; forcePinsLowRaw()
+// guarantees HIN=LOW and LIN=LOW so the half-bridge sits in a safe idle state.
 void gatesForceOff() {
   mcpwm_stop(MCPWM_UNIT_0, MCPWM_TIMER_0);
   forcePinsLowRaw();
 }
 
+// Re-bind GPIO pins to the MCPWM peripheral and restart the timer.
+// Must be called after gatesForceOff() before any new duty can be applied.
 void gatesResume() {
   mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, PWM_HIGH_SIDE_PIN);
   mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0B, PWM_LOW_SIDE_PIN);
   mcpwm_start(MCPWM_UNIT_0, MCPWM_TIMER_0);
 }
 
+// Stop the charger, record the reason and stop type, and cut the gates.
+// STOP_AUTO_PV timestamps the stop so the auto-restart timer can run.
 void stopCharging(const String &reason, StopType stopType) {
   gatesForceOff();
   mpptRunning    = false;
@@ -602,6 +695,16 @@ float computeFeedforwardDutyPercent() {
   return duty;
 }
 
+// Validate preconditions, compute the mode-specific starting duty, then
+// arm the gates and transition to STAGE_RAMPING (MPPT/HYBRID) or STAGE_BULK (PWM_AUTO).
+//
+// Starting duty selection:
+//   MPPT     — FOCV feedforward only; AI has no involvement.
+//   HYBRID   — AI predicted duty when model is warm; falls back to FOCV.
+//   PWM_AUTO — fixed MPPT_DUTY_MIN_PERCENT; CC controller ramps up naturally.
+//
+// Returns true on success; on failure fills errorOut and returns false without
+// touching the gates.
 bool startCharging(String &errorOut) {
   if (!pvSensorOk || !battSensorOk) {
     errorOut = String(!pvSensorOk ? "PV" : "Battery") + " INA260 sensor not available";
@@ -680,92 +783,150 @@ static void applyCC_CV(float &duty) {
   duty = constrain(duty, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
 }
 
-// Stop charging when all termination conditions are satisfied.
-static void checkTermination(const String &label) {
-  if (chargeStage != STAGE_HOLDING || !hasSeenCurrentFlow) return;
-  if (batteryVoltage >= batteryFullVoltage() - BATTERY_FULL_TOLERANCE_V &&
+// Forward declarations for PWM_AUTO helpers used by mpptStep and hybridStep.
+float pwmAbsorbVoltage();
+float pwmFloatVoltage();
+
+// ---- Shared CC-CV stage helpers (used by all three step functions) ----------
+
+// Float stage: proportional CV at float voltage; re-bulks on voltage droop.
+static void handleFloatStage(float &duty, const char *label) {
+  const float floatV = pwmFloatVoltage();
+  if (batteryVoltage < floatV - PWM_REBULK_HYST_V) {
+    chargeStage = STAGE_BULK;
+    Serial.printf("%s: voltage droop — re-entering Bulk\n", label);
+  } else {
+    const float corr = constrain(PWMCV_KP_VOLTAGE * (floatV - batteryVoltage),
+                                 -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+    duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+  }
+}
+
+// Absorption stage: proportional CV at temperature-compensated target.
+// Returns false (and has called stopCharging) when the charge cycle ends — caller must return.
+static bool handleAbsorptionStage(float &duty, const char *label) {
+  const float absorbV = pwmAbsorbVoltage();
+  const float corr    = constrain(PWMCV_KP_VOLTAGE * (absorbV - batteryVoltage),
+                                  -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+  duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+  if (hasSeenCurrentFlow &&
+      batteryVoltage >= absorbV - BATTERY_FULL_TOLERANCE_V &&
       batteryCurrent <= TERMINATION_CURRENT_A &&
       millis() - chargingStartTime >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
-    stopCharging("Charging complete -- battery full (" + label + ")", STOP_COMPLETE);
+    if (pwmFloatVoltage() > 0.0f) {
+      chargeStage = STAGE_FLOAT;
+      Serial.printf("%s: absorption complete — entering Float\n", label);
+    } else {
+      stopCharging("Charging complete — battery full (" +
+                   String(CHEMISTRY_NAMES[selectedChemistry]) + ")", STOP_COMPLETE);
+      return false;
+    }
   }
+  return true;
+}
+
+// Apply duty to hardware and update bookkeeping counters.
+static void commitDuty(float duty) {
+  pwmSetDuty(duty);
+  perturbCount++;
+  if (batteryCurrent > CURRENT_FLOW_DETECT_A) hasSeenCurrentFlow = true;
 }
 
 // ---- P&O and fixed-PWM controllers ------------------------------------------
 
-// Duty-cycle P&O MPPT: nudge duty in the direction that increased PV power last
-// step; reverse when power drops. Ramp ceiling and current cap are hard limits
-// layered on top -- P&O keeps running throughout (Option B).
+// P&O MPPT with full CC-CV stage machine.
 //
-// pvPower is the global updated by sampleSensors() from INA260's native power
-// register. MPPT does not read sensors directly.
+// Bulk/Ramping: fixed MPPT_DUTY_STEP_PERCENT step each tick; direction reverses
+// when pvPower < previousPvPower.  CC and ramp-ceiling hard limits on top.
+//
+// Absorption (STAGE_HOLDING): P&O hands over to proportional CV control at the
+// temperature-compensated absorption voltage.  Terminates on current taper or
+// transitions to Float for LiFePO4.
+//
+// Float (STAGE_FLOAT, LiFePO4 only): proportional CV at float voltage.
+// Re-enters Bulk on voltage droop > PWM_REBULK_HYST_V.
 void mpptStep() {
-  if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+  float duty = dutyPercent;
 
-  dutyPercent = constrain(dutyPercent + perturbDirection * MPPT_DUTY_STEP_PERCENT,
-                          MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
-  previousPvPower = pvPower;
-
-  advanceRampAndStage();
-  applyCC_CV(dutyPercent);
-  pwmSetDuty(dutyPercent);
-  perturbCount++;
-
-  if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
-  checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
-}
-
-// Hybrid P&O + AI controller.
-// Three operating zones based on distance from AI's predicted optimal duty:
-//
-//  Far  (gap > NEAR_BAND): AI overrides perturbDirection toward target, large step.
-//  Near (HOLD_BAND < gap <= NEAR_BAND): P&O governs direction normally, fine step.
-//  Hold (gap <= HOLD_BAND AND |ΔP| < threshold): skip perturbation, stay at current duty.
-//
-// Falls back to standard P&O (MPPT_DUTY_STEP_PERCENT) when regValid is false.
-void hybridStep() {
-  float step = MPPT_DUTY_STEP_PERCENT;  // default: full P&O step
-
-  if (regValid) {
-    const float diff    = regPredDutyPct - dutyPercent;
-    const float absDiff = fabsf(diff);
-
-    // Hold zone: AI is confident, duty is close, and power is stable.
-    if (absDiff <= HYBRID_HOLD_BAND_PERCENT &&
-        fabsf(pvPower - previousPvPower) < HYBRID_HOLD_POWER_W) {
-      previousPvPower = pvPower;
-      advanceRampAndStage();
-      applyCC_CV(dutyPercent);
-      pwmSetDuty(dutyPercent);
-      perturbCount++;
-      if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
-      checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
-      return;
-    }
-
-    if (absDiff > HYBRID_NEAR_BAND_PERCENT) {
-      // Far zone: AI overrides direction, accelerate toward AI target.
-      perturbDirection = (diff > 0.0f) ? 1 : -1;
-      step = HYBRID_STEP_FAR_PERCENT;
-    } else {
-      // Near zone: P&O governs direction via power gradient, fine step.
-      if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
-      step = HYBRID_STEP_NEAR_PERCENT;
-    }
+  if (chargeStage == STAGE_FLOAT) {
+    handleFloatStage(duty, "MPPT");
+  } else if (chargeStage == STAGE_HOLDING) {
+    if (!handleAbsorptionStage(duty, "MPPT")) return;
   } else {
-    // AI not valid — pure P&O fallback with standard step.
+    // Bulk / Ramping: fixed-step P&O, CC + ramp-ceiling hard limits on top.
     if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+    duty = constrain(duty + perturbDirection * MPPT_DUTY_STEP_PERCENT,
+                     MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+    previousPvPower = pvPower;
+    advanceRampAndStage();
+    applyCC_CV(duty);
   }
 
-  dutyPercent = constrain(dutyPercent + perturbDirection * step,
-                          MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
-  previousPvPower = pvPower;
+  commitDuty(duty);
+}
 
-  advanceRampAndStage();
-  applyCC_CV(dutyPercent);
-  pwmSetDuty(dutyPercent);
-  perturbCount++;
-  if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
-  checkTermination(CHEMISTRY_NAMES[selectedChemistry]);
+// HYB-AIMLSL controller: AI-guided P&O in Bulk, proportional CV in Absorption/Float.
+//
+// Bulk / Ramping — three AI zones:
+//   Hold (gap ≤ HOLD_BAND + stable power): skip perturbation. Band doubles when cloudy.
+//   Far  (gap > NEAR_BAND): AI overrides direction, large step. Disabled → P&O + std step.
+//   Near (HOLD_BAND < gap ≤ NEAR_BAND): P&O direction, fine step. Disabled → std step.
+//   Falls back to standard P&O when regValid is false.
+//
+// Absorption (STAGE_HOLDING): AI hands over to proportional CV at temperature-compensated
+// target voltage. Terminates on current taper or transitions to Float for LiFePO4.
+//
+// Float (STAGE_FLOAT, LiFePO4 only): proportional CV at float voltage; re-bulks on droop.
+void hybridStep() {
+  float duty = dutyPercent;
+
+  if (chargeStage == STAGE_FLOAT) {
+    handleFloatStage(duty, "HYBRID");
+  } else if (chargeStage == STAGE_HOLDING) {
+    if (!handleAbsorptionStage(duty, "HYBRID")) return;
+  } else {
+    // Bulk / Ramping: AI-guided P&O with three zones.
+    float step = MPPT_DUTY_STEP_PERCENT;
+
+    if (regValid) {
+      const float diff    = regPredDutyPct - dutyPercent;
+      const float absDiff = fabsf(diff);
+
+      const float holdBand = cloudyCondition ? HYBRID_HOLD_BAND_PERCENT * 2.0f
+                                             : HYBRID_HOLD_BAND_PERCENT;
+      if (hybZoneHoldEnabled &&
+          absDiff <= holdBand &&
+          fabsf(pvPower - previousPvPower) < HYBRID_HOLD_POWER_W) {
+        previousPvPower = pvPower;
+        advanceRampAndStage();
+        applyCC_CV(duty);
+        commitDuty(duty);
+        return;
+      }
+
+      if (absDiff > HYBRID_NEAR_BAND_PERCENT) {
+        if (hybZoneFarEnabled) {
+          perturbDirection = (diff > 0.0f) ? 1 : -1;
+          step = HYBRID_STEP_FAR_PERCENT;
+        } else {
+          if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+        }
+      } else {
+        if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+        if (hybZoneNearEnabled) step = HYBRID_STEP_NEAR_PERCENT;
+      }
+    } else {
+      if (pvPower < previousPvPower) perturbDirection = -perturbDirection;
+    }
+
+    duty = constrain(duty + perturbDirection * step,
+                     MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
+    previousPvPower = pvPower;
+    advanceRampAndStage();
+    applyCC_CV(duty);
+  }
+
+  commitDuty(duty);
 }
 
 // ---- Auto PWM (commercial CC-CV) helpers ------------------------------------
@@ -774,8 +935,8 @@ void hybridStep() {
 // Reduces absorption target by 3mV/°C/cell above 25°C to prevent overcharging hot packs.
 float pwmAbsorbVoltage() {
   float base = batteryFullVoltage();
-  if (ntcValid && batteryTempC > 25.0f) {
-    float comp = (batteryTempC - 25.0f) * (PWM_TEMP_COMP_MV_CELL / 1000.0f) * selectedCellCount;
+  if (ntcValid && batteryTempC > NTC_T_NOMINAL_C) {
+    float comp = (batteryTempC - NTC_T_NOMINAL_C) * (PWM_TEMP_COMP_MV_CELL / 1000.0f) * selectedCellCount;
     base -= comp;
   }
   return base;
@@ -796,57 +957,39 @@ void pwmAutoStep() {
   float duty = dutyPercent;
 
   if (chargeStage == STAGE_FLOAT) {
-    float floatV = pwmFloatVoltage();
-    // Re-bulk if battery draws significantly below float (load pulling it down).
-    if (batteryVoltage < floatV - PWM_REBULK_HYST_V) {
-      chargeStage = STAGE_BULK;
-      Serial.println("PWM_AUTO: voltage droop — re-entering Bulk");
-    } else {
-      float err  = floatV - batteryVoltage;
-      float corr = constrain(PWMCV_KP_VOLTAGE * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
-      duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
-    }
+    handleFloatStage(duty, "PWM_AUTO");
   } else if (chargeStage == STAGE_HOLDING) {
-    float absorbV = pwmAbsorbVoltage();
-    float err     = absorbV - batteryVoltage;
-    float corr    = constrain(PWMCV_KP_VOLTAGE * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
-    duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
-
-    // Transition to Float (LiFePO4) or terminate (others) at C/20.
-    if (hasSeenCurrentFlow &&
-        batteryVoltage >= absorbV - BATTERY_FULL_TOLERANCE_V &&
-        batteryCurrent <= TERMINATION_CURRENT_A &&
-        millis() - chargingStartTime >= MIN_CHARGE_RUNTIME_BEFORE_TERMINATION_MS) {
-      if (pwmFloatVoltage() > 0.0f) {
-        chargeStage = STAGE_FLOAT;
-        Serial.println("PWM_AUTO: absorption complete — entering Float");
-      } else {
-        stopCharging("Charging complete — battery full (" +
-                     String(CHEMISTRY_NAMES[selectedChemistry]) + ")", STOP_COMPLETE);
-        return;
-      }
-    }
+    if (!handleAbsorptionStage(duty, "PWM_AUTO")) return;
   } else {
     // BULK (CC): proportional current control toward MAX_CHARGE_CURRENT_A.
-    float err  = MAX_CHARGE_CURRENT_A - batteryCurrent;
-    float corr = constrain(PWMCC_KP_CURRENT * err, -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
+    const float corr = constrain(PWMCC_KP_CURRENT * (MAX_CHARGE_CURRENT_A - batteryCurrent),
+                                 -PWMCC_MAX_STEP, PWMCC_MAX_STEP);
     duty = constrain(duty + corr, MPPT_DUTY_MIN_PERCENT, MPPT_DUTY_MAX_PERCENT);
-
-    // Transition to Absorption when battery reaches absorption voltage.
     if (batteryVoltage >= pwmAbsorbVoltage() - BATTERY_FULL_TOLERANCE_V) {
       chargeStage = STAGE_HOLDING;
       Serial.println("PWM_AUTO: target voltage reached — entering Absorption (CV)");
     }
+    applyCC_CV(duty);  // hard current cap backstop
   }
 
-  pwmSetDuty(duty);
-  perturbCount++;
-  if (batteryCurrent > 0.1f) hasSeenCurrentFlow = true;
+  commitDuty(duty);
 }
 
-// Vmp predictor — observation only, no hardware access.
-// 14 raw features → predicted Vmp (V). vmpForwardPass() normalises internally.
+// Vmp predictor — observation only, never touches PWM or P&O variables.
+// Runs every MPPT_STEP_INTERVAL_MS. Output is regPredVmpV (V) and regPredDutyPct (%).
+//
+// Feature vector (14): instantaneous panel/battery electrical state + delta values
+// computed from the previous tick.  Order must match vmp_scaler.json exactly.
+//
+// Transient recovery: if |ΔPpv| > 2W the prediction is too noisy to trust.
+// vmpWasTransient is set true and regValid=false for that tick.  On the next valid
+// tick serviceCharger() uses vmpTransientRecovery to re-seed the HYBRID duty from
+// the fresh prediction, preventing P&O from diverging after a cloud shadow clears.
 void runVmpInference() {
+  static float regPrevPvVoltage = 0.0f;
+  static float regPrevPvCurrent = 0.0f;
+  static float regPrevPvPower   = 0.0f;
+  static bool  vmpWasTransient  = false;
   if (!pvSensorOk || !battSensorOk) { regValid = false; return; }
 
   const float dPvPower = pvPower - regPrevPvPower;
@@ -921,6 +1064,11 @@ void checkAutoRestart() {
   }
 }
 
+// Main charger tick — called every loop().
+// Runs inference, handles the AI transient re-seed (HYBRID only), then dispatches
+// to the active step function (mpptStep / hybridStep / pwmAutoStep) on each
+// MPPT_STEP_INTERVAL_MS boundary.  Also handles auto-stop on PV undervoltage and
+// auto-restart polling when the charger is idle.
 void serviceCharger() {
   // Auto-stop if PV no longer has enough headroom over battery target.
   if (mpptRunning && pvVoltage < (batteryFullVoltage() + MPPT_MIN_PV_HEADROOM_RUNNING_V)) {
@@ -967,8 +1115,11 @@ static const char *jsonEscape(const String &s, char *out, size_t outLen) {
   return out;
 }
 
+// Serialize the complete runtime snapshot as a JSON object and send it to the dashboard.
+// All live measurements, stage/mode state, sensor health flags, energy totals,
+// AI prediction outputs, cloudy flag, and zone enables are included.
 void handleState() {
-  static char buf[1900];
+  static char buf[2048];
   static char escapedMsg[256];
   float fullV = batteryFullVoltage();
   jsonEscape(lastStopReason, escapedMsg, sizeof(escapedMsg));
@@ -1025,7 +1176,11 @@ void handleState() {
     "\"autoRestartCountdown\":%u,"
     "\"regValid\":%s,"
     "\"regPredVmpV\":%.3f,"
-    "\"regPredDutyPct\":%.2f"
+    "\"regPredDutyPct\":%.2f,"
+    "\"cloudyCondition\":%s,"
+    "\"hybZoneFarEnabled\":%s,"
+    "\"hybZoneNearEnabled\":%s,"
+    "\"hybZoneHoldEnabled\":%s"
     "}",
     pvVoltage, pvCurrent, pvPower,
     batteryVoltage, batteryCurrent, batteryPower,
@@ -1074,7 +1229,11 @@ void handleState() {
       : 0u,
     regValid         ? "true" : "false",
     regPredVmpV,
-    regPredDutyPct
+    regPredDutyPct,
+    cloudyCondition  ? "true" : "false",
+    hybZoneFarEnabled  ? "true" : "false",
+    hybZoneNearEnabled ? "true" : "false",
+    hybZoneHoldEnabled ? "true" : "false"
   );
   server.send(200, "application/json", buf);
 }
@@ -1171,6 +1330,15 @@ void handleSetMode() {
   }
 }
 
+void handleSetHybZones() {
+  if (server.hasArg("far"))  hybZoneFarEnabled  = (server.arg("far")  == "1");
+  if (server.hasArg("near")) hybZoneNearEnabled = (server.arg("near") == "1");
+  if (server.hasArg("hold")) hybZoneHoldEnabled = (server.arg("hold") == "1");
+  Serial.printf("HYB zones: far=%d near=%d hold=%d\n",
+                hybZoneFarEnabled, hybZoneNearEnabled, hybZoneHoldEnabled);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
@@ -1244,8 +1412,9 @@ void setup() {
 
   // ---- WiFi AP ----
   WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);  // disable modem sleep — prevents AP from dropping clients
   WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAP(AP_SSID, AP_PASSWORD, 6);  // channel 6: stable, low interference
   IPAddress apIP = WiFi.softAPIP();
   Serial.print("AP started. Connect to Wi-Fi \"");
   Serial.print(AP_SSID);
@@ -1253,6 +1422,16 @@ void setup() {
   Serial.println(apIP);
 
   // ---- HTTP routes ----
+  // GET  /          — serve dashboard (index.html from LittleFS)
+  // GET  /state     — JSON snapshot of all runtime state (polled ~1 Hz by dashboard)
+  // POST /start     — arm gates and begin charging
+  // POST /stop      — stop charging (user-initiated)
+  // POST /chemistry — set battery chemistry (chem=0|1|2); rejects if running
+  // POST /cellcount — set cell count (cells=2|3); rejects if running
+  // POST /resetenergy   — zero Wh accumulators and restart session
+  // POST /autorestart   — enable/disable auto-restart on PV recovery (enable=0|1)
+  // POST /mode          — select operating mode (mode=MPPT|HYBRID|PWM_AUTO); rejects if running
+  // POST /hybzones      — enable/disable HYB-AIMLSL zones (far=0|1, near=0|1, hold=0|1)
   server.serveStatic("/", LittleFS, "/index.html");
   server.on("/state",     HTTP_GET,  handleState);
   server.on("/start",     HTTP_POST, handleStart);
@@ -1262,6 +1441,7 @@ void setup() {
   server.on("/resetenergy",  HTTP_POST, handleResetEnergy);
   server.on("/autorestart",  HTTP_POST, handleSetAutoRestart);
   server.on("/mode",         HTTP_POST, handleSetMode);
+  server.on("/hybzones",     HTTP_POST, handleSetHybZones);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -1271,6 +1451,10 @@ void setup() {
   gatesForceOff();  // boot in off state -- PWM starts only when Start is pressed
 }
 
+// Main loop — order matters:
+//   1. handleClient()  — process any pending HTTP request first (low-latency dashboard response)
+//   2. serviceSensors() — refresh EMA-filtered measurements and run aux sensors / cloudy detector
+//   3. serviceCharger() — run one P&O / CC-CV step if the interval has elapsed
 void loop() {
   server.handleClient();
   serviceSensors();

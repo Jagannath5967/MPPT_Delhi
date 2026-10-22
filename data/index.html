@@ -112,11 +112,12 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI"
 .ctrl-msg.err{color:var(--red);}
 
 /* ── Mode toggle ── */
-.mode-btn{border:1px solid var(--border);background:var(--bg3);color:var(--text2);padding:3px 10px;border-radius:6px;font-size:.76em;font-weight:700;cursor:pointer;transition:all .15s;}
+.mode-btn{border:1px solid var(--border);background:var(--bg3);color:var(--text2);padding:3px 10px;border-radius:6px;font-size:.76em;font-weight:700;cursor:pointer;transition:all .2s;}
 .mode-btn:hover:not(:disabled){color:var(--text);}
-.mode-btn.m-mppt{background:rgba(0,200,255,.15);color:var(--cyan);border-color:rgba(0,200,255,.4);}
-.mode-btn.m-hybrid{background:rgba(156,107,255,.15);color:var(--purple);border-color:rgba(156,107,255,.4);}
-.mode-btn.m-pwm-auto{background:rgba(52,211,153,.15);color:#34d399;border-color:rgba(52,211,153,.4);}
+.mode-btn.m-mppt{background:rgba(0,200,255,.2);color:var(--cyan);border-color:var(--cyan);box-shadow:0 0 8px rgba(0,200,255,.35);}
+.mode-btn.m-hybrid{background:rgba(156,107,255,.2);color:var(--purple);border-color:var(--purple);box-shadow:0 0 8px rgba(156,107,255,.35);}
+.mode-btn.m-pwm-auto{background:rgba(52,211,153,.2);color:#34d399;border-color:#34d399;box-shadow:0 0 8px rgba(52,211,153,.35);}
+.mode-btn.mode-inactive{opacity:.35;}
 .mode-btn:disabled{opacity:.4;cursor:not-allowed;}
 
 /* ── Selects ── */
@@ -188,10 +189,11 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   <span id="t-stage">Stopped</span>
   <div id="mode-toggle" style="display:flex;gap:3px;flex-shrink:0;" title="Operating mode — locked while charging">
     <button id="btn-mode-mppt"     class="mode-btn m-mppt" onclick="doSetMode('MPPT')">MPPT</button>
-    <button id="btn-mode-hybrid"   class="mode-btn"        onclick="doSetMode('HYBRID')">Hybrid</button>
+    <button id="btn-mode-hybrid"   class="mode-btn"        onclick="doSetMode('HYBRID')">HYB-AIMLSL</button>
     <button id="btn-mode-pwm-auto" class="mode-btn"        onclick="doSetMode('PWM_AUTO')">Auto PWM</button>
   </div>
   <span id="t-msg">Connecting…</span>
+  <span id="t-cloudy" title="Cloudy condition detected" style="display:none;font-size:.85em;background:rgba(148,163,184,.18);color:#94a3b8;border:1px solid rgba(148,163,184,.35);border-radius:6px;padding:2px 7px;flex-shrink:0;">☁ Cloudy</span>
   <div class="t-right">
     <span id="t-uptime">00:00:00</span>
     <button id="btn-estop" onclick="doStop()">■ STOP</button>
@@ -214,6 +216,8 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   <div class="nav-item" data-tab="logs"><span class="nav-icon">≡</span>Event Logs</div>
   <div class="nav-item" data-tab="aimonitor"><span class="nav-icon">◈</span>AI Monitor</div>
   <div class="nav-item" data-tab="settings"><span class="nav-icon">◎</span>Settings</div>
+  <div class="nav-sep"></div>
+  <div class="nav-item" data-tab="history"><span class="nav-icon">▤</span>Session History</div>
 </nav>
 
 <!-- ════ CONTENT ════ -->
@@ -647,7 +651,7 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
         <div class="sel-lbl">Operating mode (locked while charging)</div>
         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
           <button id="st-btn-mppt"     class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('MPPT')">⟳ MPPT</button>
-          <button id="st-btn-hybrid"   class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('HYBRID')">◈ Hybrid</button>
+          <button id="st-btn-hybrid"   class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('HYBRID')">◈ HYB-AIMLSL</button>
           <button id="st-btn-pwm-auto" class="btn btn-sm" style="flex:1;font-weight:700;" onclick="doSetMode('PWM_AUTO')">⚡ Auto PWM</button>
         </div>
         <div style="font-size:.71em;color:var(--muted);margin-top:5px;line-height:1.5;">
@@ -658,6 +662,37 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
       </div>
       <div class="ctrl-msg" id="st-mode-msg" style="margin-top:8px;"></div>
     </div>
+
+    <!-- HYB-AIMLSL zone control — visible only when mode is HYBRID -->
+    <div class="card" id="st-hybzones-card" style="display:none;">
+      <div class="card-head"><span class="card-icon">◈</span><span class="card-title">HYB-AIMLSL Zone Control</span></div>
+      <div style="font-size:.76em;color:var(--muted);margin-bottom:12px;">Enable or disable each AI zone. Disabled zones fall back to standard P&amp;O.</div>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+          <input type="checkbox" id="hz-far"  onchange="doHybZone()" style="margin-top:2px;accent-color:var(--purple);">
+          <div>
+            <div style="font-weight:700;color:var(--purple);font-size:.85em;">Far Zone</div>
+            <div style="font-size:.73em;color:var(--muted);">Gap &gt; 2% — AI overrides direction, 0.5% step (fast convergence)</div>
+          </div>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+          <input type="checkbox" id="hz-near" onchange="doHybZone()" style="margin-top:2px;accent-color:var(--purple);">
+          <div>
+            <div style="font-weight:700;color:var(--purple);font-size:.85em;">Near Zone</div>
+            <div style="font-size:.73em;color:var(--muted);">Gap 0.5–2% — P&amp;O direction, AI fine step 0.1%</div>
+          </div>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+          <input type="checkbox" id="hz-hold" onchange="doHybZone()" style="margin-top:2px;accent-color:var(--purple);">
+          <div>
+            <div style="font-weight:700;color:var(--purple);font-size:.85em;">Hold Zone</div>
+            <div style="font-size:.73em;color:var(--muted);">Gap ≤ 0.5% + stable power — skip perturbation, stay at current duty</div>
+          </div>
+        </label>
+      </div>
+      <div class="ctrl-msg" id="st-hybzones-msg" style="margin-top:10px;"></div>
+    </div>
+
     <div class="card">
       <div class="card-head"><span class="card-icon">◎</span><span class="card-title">Battery Chemistry</span></div>
       <div style="margin-bottom:12px;">
@@ -702,6 +737,49 @@ select.sel:disabled{opacity:.5;cursor:not-allowed;}
   </div>
 </div><!-- /settings -->
 
+<!-- ── TAB: SESSION HISTORY ── -->
+<div id="tab-history" class="tab">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+    <span style="font-size:1em;font-weight:700;color:var(--text);">Session History</span>
+    <span id="hist-count" style="font-size:.75em;color:var(--text2);"></span>
+    <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;">
+      <button class="btn btn-sm" onclick="exportSessionCSV()">⬇ Export CSV</button>
+      <button class="btn btn-sm" onclick="exportSessionJSON()">⬇ Export JSON</button>
+      <button class="btn btn-sm" style="color:var(--red);border-color:var(--red);" onclick="clearSessionHistory()">✕ Clear History</button>
+    </div>
+  </div>
+  <div style="overflow-x:auto;">
+    <table id="hist-table" style="width:100%;border-collapse:collapse;font-size:.78em;">
+      <thead>
+        <tr style="color:var(--text2);border-bottom:1px solid var(--border);text-align:left;">
+          <th style="padding:6px 10px;">#</th>
+          <th style="padding:6px 10px;">Date / Time</th>
+          <th style="padding:6px 10px;">Mode</th>
+          <th style="padding:6px 10px;">Duration</th>
+          <th style="padding:6px 10px;">Peak PV (W)</th>
+          <th style="padding:6px 10px;">Avg PV (W)</th>
+          <th style="padding:6px 10px;">PV Energy (Wh)</th>
+          <th style="padding:6px 10px;">Batt Energy (Wh)</th>
+          <th style="padding:6px 10px;">Efficiency (%)</th>
+          <th style="padding:6px 10px;">Chemistry</th>
+          <th style="padding:6px 10px;">Cells</th>
+          <th style="padding:6px 10px;" title="Number of times cloudy condition triggered">☁ Events</th>
+          <th style="padding:6px 10px;" title="Total duration of cloudy condition">☁ Total Time</th>
+          <th style="padding:6px 10px;" title="Average solar irradiance during session">Avg Irr (W/m²)</th>
+          <th style="padding:6px 10px;" title="Average ambient temperature during session">Avg Temp (°C)</th>
+          <th style="padding:6px 10px;">Stop Reason</th>
+        </tr>
+      </thead>
+      <tbody id="hist-tbody">
+        <tr><td colspan="12" style="padding:20px;text-align:center;color:var(--muted);">No sessions recorded yet. Session data is saved automatically when charging stops.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div style="font-size:.71em;color:var(--muted);margin-top:10px;">
+    Up to 50 sessions stored in browser localStorage. Data persists across page reloads on this device.
+  </div>
+</div><!-- /history -->
+
 </div><!-- /content -->
 
 <script>
@@ -723,6 +801,12 @@ const PVS=[]; // {v,p} P-V scatter
 let peakW=0,peakV=0,wasRun=false,busy=false,connected=false;
 let dashStart=Date.now(),lastStage='',lastConnected=null;
 let sessionStart=Date.now(),lastSessionId=-1;
+// ── Session history tracking ──
+const SH_KEY='mppt_session_history';
+let shPrevRunning=false,shSessionStart=null,shPvPowerSum=0,shPvPowerCount=0,shPeakPvPower=0;
+let shMode='',shChemistry='',shCellCount=0,shSessionId=-1;
+let shCloudyCount=0,shCloudyTotalMs=0,shCloudyStartMs=null,shPrevCloudy=false;
+let shIrradianceSum=0,shIrradianceCount=0,shAmbTempSum=0,shAmbTempCount=0;
 const LOGS=[];
 let lastState=null;
 // AI tracking state
@@ -1075,6 +1159,117 @@ function t3(v){return isFinite(v)?v.toFixed(3):'--';}
 function t2(v){return isFinite(v)?v.toFixed(2):'--';}
 function t1(v){return isFinite(v)?v.toFixed(1):'--';}
 
+/* ── Session History ── */
+function shLoad(){try{return JSON.parse(localStorage.getItem(SH_KEY)||'[]');}catch{return [];}}
+function shSave(arr){try{localStorage.setItem(SH_KEY,JSON.stringify(arr));}catch{}}
+
+function shRecord(d){
+  if(!shSessionStart) return;
+  const endTime=Date.now();
+  const durationSec=Math.round((endTime-shSessionStart)/1000);
+  const avgPv=shPvPowerCount>0?shPvPowerSum/shPvPowerCount:0;
+  const entry={
+    id:       shSessionId,
+    startISO: new Date(shSessionStart).toISOString(),
+    endISO:   new Date(endTime).toISOString(),
+    durationSec,
+    mode:     shMode||'MPPT',
+    peakPvW:  parseFloat(shPeakPvPower.toFixed(3)),
+    avgPvW:   parseFloat(avgPv.toFixed(3)),
+    pvEnergyWh:   parseFloat((d.pvEnergyWh||0).toFixed(4)),
+    battEnergyWh: parseFloat((d.batteryEnergyWh||0).toFixed(4)),
+    efficiencyPct: d.pvEnergyWh>0.001 ? parseFloat(d.cumulativeEfficiency.toFixed(2)) : 0,
+    chemistry: shChemistry,
+    cellCount: shCellCount,
+    stopReason: d.statusMessage||'',
+    cloudyCount: shCloudyCount,
+    cloudyTotalSec: Math.round((shCloudyTotalMs + (shCloudyStartMs ? Date.now()-shCloudyStartMs : 0)) / 1000),
+    avgIrradianceWm2: parseFloat((shIrradianceCount>0 ? shIrradianceSum/shIrradianceCount : 0).toFixed(1)),
+    avgAmbientTempC:  parseFloat((shAmbTempCount>0    ? shAmbTempSum/shAmbTempCount       : 0).toFixed(1))
+  };
+  const arr=shLoad();
+  arr.unshift(entry);
+  if(arr.length>50) arr.length=50;
+  shSave(arr);
+  shRender();
+  shSessionStart=null; shPvPowerSum=0; shPvPowerCount=0; shPeakPvPower=0;
+  shCloudyCount=0; shCloudyTotalMs=0; shCloudyStartMs=null; shPrevCloudy=false;
+  shIrradianceSum=0; shIrradianceCount=0; shAmbTempSum=0; shAmbTempCount=0;
+}
+
+function shRender(){
+  const arr=shLoad();
+  const cnt=document.getElementById('hist-count');
+  if(cnt) cnt.textContent=arr.length+' session'+(arr.length!==1?'s':'');
+  const tb=document.getElementById('hist-tbody');
+  if(!tb) return;
+  if(arr.length===0){
+    tb.innerHTML='<tr><td colspan="16" style="padding:20px;text-align:center;color:var(--muted);">No sessions recorded yet.</td></tr>';
+    return;
+  }
+  const modeColor={'MPPT':'var(--cyan)','HYBRID':'var(--purple)','PWM_AUTO':'#34d399'};
+  tb.innerHTML=arr.map((s,i)=>{
+    const dt=new Date(s.startISO);
+    const dtStr=dt.toLocaleDateString()+' '+dt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    const dur=s.durationSec>=3600?Math.floor(s.durationSec/3600)+'h '+(Math.floor(s.durationSec/60)%60)+'m':Math.floor(s.durationSec/60)+'m '+(s.durationSec%60)+'s';
+    const mc=modeColor[s.mode]||'var(--text)';
+    const eff=s.efficiencyPct>0?s.efficiencyPct.toFixed(1)+'%':'—';
+    const stop=s.stopReason.length>40?s.stopReason.slice(0,38)+'…':s.stopReason;
+    const cloudyCount=s.cloudyCount||0;
+    const cloudySec=s.cloudyTotalSec||0;
+    const cloudyDur=cloudySec>=3600?Math.floor(cloudySec/3600)+'h '+(Math.floor(cloudySec/60)%60)+'m':cloudySec>=60?Math.floor(cloudySec/60)+'m '+(cloudySec%60)+'s':cloudySec+'s';
+    return `<tr style="border-bottom:1px solid var(--border);${i%2===0?'':'background:var(--bg2)'}">
+      <td style="padding:5px 10px;color:var(--muted);">${arr.length-i}</td>
+      <td style="padding:5px 10px;white-space:nowrap;">${dtStr}</td>
+      <td style="padding:5px 10px;font-weight:700;color:${mc};">${s.mode}</td>
+      <td style="padding:5px 10px;">${dur}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.peakPvW.toFixed(2)}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.avgPvW.toFixed(2)}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.pvEnergyWh.toFixed(3)}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.battEnergyWh.toFixed(3)}</td>
+      <td style="padding:5px 10px;font-family:monospace;color:${s.efficiencyPct>90?'var(--green)':s.efficiencyPct>75?'var(--yellow)':'var(--text)'};">${eff}</td>
+      <td style="padding:5px 10px;font-size:.9em;">${s.chemistry||'—'}</td>
+      <td style="padding:5px 10px;text-align:center;">${s.cellCount||'—'}</td>
+      <td style="padding:5px 10px;text-align:center;color:${cloudyCount>0?'#94a3b8':'var(--muted)'};">${cloudyCount>0?'☁ '+cloudyCount:'—'}</td>
+      <td style="padding:5px 10px;text-align:center;color:${cloudySec>0?'#94a3b8':'var(--muted)'};">${cloudySec>0?cloudyDur:'—'}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.avgIrradianceWm2>0?s.avgIrradianceWm2.toFixed(1):'—'}</td>
+      <td style="padding:5px 10px;font-family:monospace;">${s.avgAmbientTempC>0?s.avgAmbientTempC.toFixed(1):'—'}</td>
+      <td style="padding:5px 10px;color:var(--text2);font-size:.88em;" title="${s.stopReason}">${stop||'—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function exportSessionCSV(){
+  const arr=shLoad();
+  if(!arr.length){alert('No session data to export.');return;}
+  const hdr='Session#,Date,Time,Mode,Duration(s),PeakPV(W),AvgPV(W),PVEnergy(Wh),BattEnergy(Wh),Efficiency(%),Chemistry,Cells,CloudyEvents,CloudyTotalSec,AvgIrradiance(W/m2),AvgAmbientTemp(C),StopReason\n';
+  const rows=arr.map((s,i)=>{
+    const dt=new Date(s.startISO);
+    const stop='"'+s.stopReason.replace(/"/g,'""')+'"';
+    const chem='"'+s.chemistry.replace(/"/g,'""')+'"';
+    return [arr.length-i,dt.toLocaleDateString(),dt.toLocaleTimeString(),s.mode,s.durationSec,s.peakPvW,s.avgPvW,s.pvEnergyWh,s.battEnergyWh,s.efficiencyPct,chem,s.cellCount,s.cloudyCount||0,s.cloudyTotalSec||0,s.avgIrradianceWm2||0,s.avgAmbientTempC||0,stop].join(',');
+  }).join('\n');
+  dlFile('mppt_sessions_'+new Date().toISOString().slice(0,10)+'.csv','text/csv',hdr+rows);
+}
+
+function exportSessionJSON(){
+  const arr=shLoad();
+  if(!arr.length){alert('No session data to export.');return;}
+  dlFile('mppt_sessions_'+new Date().toISOString().slice(0,10)+'.json','application/json',JSON.stringify(arr,null,2));
+}
+
+function dlFile(name,type,content){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([content],{type}));
+  a.download=name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+function clearSessionHistory(){
+  if(!confirm('Clear all session history? This cannot be undone.')) return;
+  try{localStorage.removeItem(SH_KEY);}catch{}
+  shRender();
+}
+
 /* ── Main state update ── */
 async function refresh(){
   try{
@@ -1084,6 +1279,9 @@ async function refresh(){
     // connection
     if(!connected){addLog('Connection established','ev-conn');connected=true;}
     document.getElementById('t-dot').className='ok';
+
+    // cloudy badge
+    document.getElementById('t-cloudy').style.display = d.cloudyCondition ? '' : 'none';
 
     // history
     push(H.t,Date.now());push(H.pvV,d.pvVoltage);push(H.pvA,d.pvCurrent);push(H.pvW,d.pvPower);
@@ -1098,6 +1296,32 @@ async function refresh(){
     // AI Monitor — regression history
     push(H.regPredDuty, d.regValid && d.mpptRunning ? d.regPredDutyPct : null);
     push(H.regPredVmp,  d.regValid && d.mpptRunning ? d.regPredVmpV   : null);
+
+    // ── Session history tracking ──
+    if(d.mpptRunning && !shPrevRunning){
+      // session just started
+      shSessionStart=Date.now(); shPvPowerSum=0; shPvPowerCount=0; shPeakPvPower=0;
+      shMode=d.operatingMode||'MPPT'; shChemistry=d.chemistryName||''; shCellCount=d.cellCount||0;
+      shSessionId=d.sessionId;
+      shCloudyCount=0; shCloudyTotalMs=0; shCloudyStartMs=null; shPrevCloudy=false;
+      shIrradianceSum=0; shIrradianceCount=0; shAmbTempSum=0; shAmbTempCount=0;
+    }
+    if(d.mpptRunning){
+      if(d.pvPower>0.05){ shPvPowerSum+=d.pvPower; shPvPowerCount++; }
+      if(d.pvPower>shPeakPvPower) shPeakPvPower=d.pvPower;
+      if(d.irradiance>0){ shIrradianceSum+=d.irradiance; shIrradianceCount++; }
+      if(d.tmpSensorOk){ shAmbTempSum+=d.temperature; shAmbTempCount++; }
+      // cloudy event tracking
+      const nowCloudy=!!d.cloudyCondition;
+      if(nowCloudy && !shPrevCloudy){ shCloudyCount++; shCloudyStartMs=Date.now(); }
+      if(!nowCloudy && shPrevCloudy && shCloudyStartMs){ shCloudyTotalMs+=Date.now()-shCloudyStartMs; shCloudyStartMs=null; }
+      shPrevCloudy=nowCloudy;
+    }
+    if(!d.mpptRunning && shPrevRunning){
+      // session just ended — record it
+      shRecord(d);
+    }
+    shPrevRunning=d.mpptRunning;
 
     // AI state tracking
     if(d.regValid) aiRecentlyValid=6; else if(aiRecentlyValid>0) aiRecentlyValid--;
@@ -1222,12 +1446,12 @@ async function refresh(){
       const sMppt=document.getElementById('st-btn-mppt');
       const sHybrid=document.getElementById('st-btn-hybrid');
       const sPwmAuto=document.getElementById('st-btn-pwm-auto');
-      if(bMppt){bMppt.className='mode-btn'+(isMppt?' m-mppt':'');bMppt.disabled=d.mpptRunning;}
-      if(bHybrid){bHybrid.className='mode-btn'+(isHybrid?' m-hybrid':'');bHybrid.disabled=d.mpptRunning;}
-      if(bPwmAuto){bPwmAuto.className='mode-btn'+(isPwmAuto?' m-pwm-auto':'');bPwmAuto.disabled=d.mpptRunning;}
-      if(sMppt){sMppt.disabled=d.mpptRunning;sMppt.style.outline=isMppt?'1px solid var(--cyan)':'';}
-      if(sHybrid){sHybrid.disabled=d.mpptRunning;sHybrid.style.outline=isHybrid?'1px solid var(--purple)':'';}
-      if(sPwmAuto){sPwmAuto.disabled=d.mpptRunning;sPwmAuto.style.outline=isPwmAuto?'1px solid #34d399':'';}
+      if(bMppt){bMppt.className='mode-btn'+(isMppt?' m-mppt':' mode-inactive');bMppt.disabled=d.mpptRunning;}
+      if(bHybrid){bHybrid.className='mode-btn'+(isHybrid?' m-hybrid':' mode-inactive');bHybrid.disabled=d.mpptRunning;}
+      if(bPwmAuto){bPwmAuto.className='mode-btn'+(isPwmAuto?' m-pwm-auto':' mode-inactive');bPwmAuto.disabled=d.mpptRunning;}
+      if(sMppt){sMppt.disabled=d.mpptRunning;sMppt.style.outline=isMppt?'2px solid var(--cyan)':'';sMppt.style.boxShadow=isMppt?'0 0 8px rgba(0,200,255,.3)':'';}
+      if(sHybrid){sHybrid.disabled=d.mpptRunning;sHybrid.style.outline=isHybrid?'2px solid var(--purple)':'';sHybrid.style.boxShadow=isHybrid?'0 0 8px rgba(156,107,255,.3)':'';}
+      if(sPwmAuto){sPwmAuto.disabled=d.mpptRunning;sPwmAuto.style.outline=isPwmAuto?'2px solid #34d399':'';sPwmAuto.style.boxShadow=isPwmAuto?'0 0 8px rgba(52,211,153,.3)':'';}
     }
 
     // ── Auto-restart toggle sync ──
@@ -1409,6 +1633,18 @@ async function refresh(){
     document.getElementById('st-term').textContent=t2(d.terminationCurrent)+' A';
     document.getElementById('st-minpv').textContent=t2(d.minStartVoltage)+' V';
 
+    // ── HYB-AIMLSL zone control ──
+    const isHybrid = d.operatingMode === 'HYBRID';
+    document.getElementById('st-hybzones-card').style.display = isHybrid ? '' : 'none';
+    if(isHybrid){
+      if(document.activeElement!==document.getElementById('hz-far'))
+        document.getElementById('hz-far').checked  = !!d.hybZoneFarEnabled;
+      if(document.activeElement!==document.getElementById('hz-near'))
+        document.getElementById('hz-near').checked = !!d.hybZoneNearEnabled;
+      if(document.activeElement!==document.getElementById('hz-hold'))
+        document.getElementById('hz-hold').checked = !!d.hybZoneHoldEnabled;
+    }
+
   }catch(e){
     if(connected){addLog('Connection lost: '+e.message,'ev-fault');connected=false;}
     document.getElementById('t-dot').className='bad';
@@ -1439,6 +1675,18 @@ async function doSetMode(mode){
 }
 
 
+async function doHybZone(){
+  const far  = document.getElementById('hz-far').checked  ? '1':'0';
+  const near = document.getElementById('hz-near').checked ? '1':'0';
+  const hold = document.getElementById('hz-hold').checked ? '1':'0';
+  try{
+    const r=await fetch('/hybzones?far='+far+'&near='+near+'&hold='+hold,{method:'POST'});
+    const d=await r.json();
+    if(d.ok){msgEl('st-hybzones-msg','Zones updated');}
+    else{msgEl('st-hybzones-msg','Update failed',true);}
+  }catch(e){msgEl('st-hybzones-msg','Connection error',true);}
+}
+
 async function doResetEnergy(){
   if(!confirm('Reset session energy counters? This cannot be undone.'))return;
   try{
@@ -1450,6 +1698,7 @@ async function doResetEnergy(){
 }
 
 addLog('Dashboard v2.0 loaded','ev-info');
+shRender();  // populate history table from localStorage on load
 // Dynamic poll: 500ms when MPPT running (catches every 500ms P&O step), 1000ms when idle.
 (async function loop(){
   await refresh();
